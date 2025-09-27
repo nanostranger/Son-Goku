@@ -3,20 +3,17 @@
   "version": "1.0.0",
   "description": "A multimodal, human-like AI companion powered by Google Gemini.",
   "main": "index.js",
-  "type": "commonjs",
-  "engines": {
-    "node": ">=18.0.0"
-  },
+  "type": "module",
   "scripts": {
     "start": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "@google/generative-ai": "",
+    "@google/genai": "^0.15.0",
     "discord.js": "^14.17.1",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "mongoose": "^8.5.2",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^3.3.2"
   }
 }
