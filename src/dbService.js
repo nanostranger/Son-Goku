@@ -1,5 +1,5 @@
 // src/dbService.js
-import mongoose from 'mongoose'; // Convert require to import
+import mongoose from 'mongoose';
 
 // --- MongoDB Schema for Conversation History ---
 const ConversationSchema = new mongoose.Schema({
@@ -19,11 +19,17 @@ const ConversationSchema = new mongoose.Schema({
         fileUri: String // Stores the Gemini File URI (e.g., files/...)
     }]
 });
-
 // A compound index to quickly fetch history for a specific user in a specific server/DM
 ConversationSchema.index({ serverId: 1, userId: 1, timestamp: -1 });
-
 const Conversation = mongoose.model('Conversation', ConversationSchema);
+
+// --- MongoDB Schema for Bot Active Status ---
+const BotStatusSchema = new mongoose.Schema({
+    serverId: { type: String, required: true, unique: true }, // Unique per server
+    isActive: { type: Boolean, default: true } // Bot is active by default
+});
+const BotStatus = mongoose.model('BotStatus', BotStatusSchema);
+
 
 /**
  * Initializes the MongoDB connection.
@@ -35,21 +41,22 @@ async function connectDB() {
         return;
     }
     try {
-        // Note: Modern Mongoose handles connection options automatically.
-        await mongoose.connect(mongoUri); 
+        await mongoose.connect(mongoUri, {
+            // Options are generally handled automatically by modern Mongoose
+        });
         console.log('MongoDB connected successfully.');
     } catch (error) {
-        console.error('MongoDB connection failed:', error);
+        console.error('MongoDB connection error:', error);
     }
 }
 
 /**
- * Saves a message (user or model) to the database.
- * @param {string} serverId - The ID of the server or 'DM'.
+ * Saves a message (user or model) to the conversation history.
+ * @param {string} serverId - The ID of the server or 'DM' for a direct message.
  * @param {string} userId - The ID of the user.
- * @param {string} content - The message content.
- * @param {string} role - 'user' or 'model'.
- * @param {Array} fileParts - Array of file parts data (optional).
+ * @param {string} content - The text content of the message.
+ * @param {string} role - The role ('user' or 'model').
+ * @param {Array<Object>} [fileParts=[]] - Array of file part objects from multimodal messages.
  */
 async function saveMessage(serverId, userId, content, role, fileParts = []) {
     if (!mongoose.connection.readyState) return;
@@ -63,44 +70,49 @@ async function saveMessage(serverId, userId, content, role, fileParts = []) {
         });
         await newMessage.save();
     } catch (error) {
-        console.error('Error saving message:', error);
+        console.error('Error saving message to DB:', error);
     }
 }
 
 /**
- * Retrieves the conversation history for a user/server context, ensuring the context
- * length remains manageable.
+ * Retrieves conversation history for context. It fetches the 20 most recent messages,
+ * and then optionally searches for a relevant older message to enable "personal context".
  * @param {string} serverId - The ID of the server or 'DM'.
  * @param {string} userId - The ID of the user.
- * @param {string} rawPrompt - The user's new prompt (used for old relevant context retrieval).
- * @returns {Array} - Array of history objects in Gemini API format.
+ * @param {string} currentPrompt - The user's latest prompt for relevance check.
+ * @returns {Array<Object>} - An array of message parts structured for the Gemini API.
  */
-async function getConversationHistory(serverId, userId, rawPrompt) {
+async function getConversationHistory(serverId, userId, currentPrompt) {
     if (!mongoose.connection.readyState) return [];
 
     let history = [];
     try {
-        // Fetch the last 15 messages for short-term memory
-        let recentMessages = await Conversation.find({ serverId: serverId, userId: userId })
-            .sort({ timestamp: -1 }) // Sort by newest first
-            .limit(15);
+        // 1. Fetch the 20 most recent messages (sliding window)
+        const recentMessages = await Conversation.find({
+            $or: [
+                { userId: userId, serverId: serverId }, // Current server/DM context
+                { userId: userId, serverId: { $ne: serverId } } // User's context across other servers/DMs (for personal context)
+            ]
+        })
+        .sort({ timestamp: -1 })
+        .limit(20)
+        .lean();
         
-        // Simple logic to potentially fetch an older, highly relevant message
-        // This is a placeholder for a more advanced retrieval augmented generation (RAG) system.
-        if (recentMessages.length < 15) {
-            // Placeholder for RAG logic: For simplicity, we just check if any message contains a key phrase
-            const relevantKeywords = ['context', 'remember', 'previous', 'last time'];
-            if (relevantKeywords.some(keyword => rawPrompt.toLowerCase().includes(keyword))) {
-                // Find an older message that contains a common theme or keyword (simple example)
-                const oldestTimestamp = recentMessages.length > 0 ? recentMessages[recentMessages.length - 1].timestamp : new Date(0);
-
+        // 2. Simple retrieval of a single potentially relevant OLD message (Personal Context)
+        let oldestTimestamp = recentMessages.length > 0 ? recentMessages[recentMessages.length - 1].timestamp : new Date();
+        
+        if (recentMessages.length === 20) {
+            // Find words longer than 3 characters to use as keywords
+            const keywords = currentPrompt.split(/\s+/).filter(w => w.length > 3).join('|'); 
+            
+            if (keywords.length > 0) {
                 const oldRelevantMessage = await Conversation.findOne({
-                    serverId: serverId,
                     userId: userId,
-                    timestamp: { $lt: oldestTimestamp }, // Find messages older than the current recent batch
-                    content: { $regex: 'important|secret|name', $options: 'i' } // Look for simple relevance
+                    timestamp: { $lt: oldestTimestamp },
+                    content: { $regex: keywords, $options: 'i' }
                 })
-                .sort({ timestamp: -1 });
+                .sort({ timestamp: -1 }) // Get the most recent match from the old messages
+                .lean();
 
                 if (oldRelevantMessage) {
                     recentMessages.unshift(oldRelevantMessage); // Add it to the beginning of the context
@@ -114,10 +126,9 @@ async function getConversationHistory(serverId, userId, rawPrompt) {
         history = recentMessages.reverse().map(msg => ({
             role: msg.role === 'user' ? 'user' : 'model',
             parts: [{ text: msg.content }]
-            // For a complete implementation, file parts would also be reconstructed here
-            // using the fileUri if they hadn't expired.
+            // Note: File parts are not retrieved here as the Gemini File API has a short expiry.
+            // A complete solution would re-upload files or use a custom storage.
         }));
-
     } catch (error) {
         console.error('Error retrieving conversation history:', error);
     }
@@ -140,10 +151,46 @@ async function resetHistory(serverId, userId) {
     }
 }
 
-// Convert module.exports to named exports
+/**
+ * Sets the active status of the bot for a given server.
+ * @param {string} serverId - The ID of the server or 'DM'.
+ * @param {boolean} isActive - The new status.
+ */
+async function setBotActiveStatus(serverId, isActive) {
+    if (!mongoose.connection.readyState) return;
+    try {
+        await BotStatus.findOneAndUpdate(
+            { serverId: serverId },
+            { isActive: isActive },
+            { upsert: true, new: true } // Create if not exists, return new doc
+        );
+        console.log(`Bot status set to ${isActive ? 'Active' : 'Inactive'} for ${serverId}.`);
+    } catch (error) {
+        console.error('Error setting bot status:', error);
+    }
+}
+
+/**
+ * Gets the active status of the bot for a given server. Defaults to active (true).
+ * @param {string} serverId - The ID of the server or 'DM'.
+ * @returns {boolean} - The active status.
+ */
+async function getBotActiveStatus(serverId) {
+    if (!mongoose.connection.readyState) return true; // Default to active if DB is down
+    try {
+        const statusDoc = await BotStatus.findOne({ serverId: serverId });
+        return statusDoc ? statusDoc.isActive : true; // Default to true if no status is found
+    } catch (error) {
+        console.error('Error getting bot status:', error);
+        return true; // Default to active on error
+    }
+}
+
 export {
     connectDB,
     saveMessage,
     getConversationHistory,
-    resetHistory
+    resetHistory,
+    setBotActiveStatus,
+    getBotActiveStatus
 };
