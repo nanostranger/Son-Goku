@@ -1,0 +1,26 @@
+{
+  "name": "son-goku-discord-bot",
+  "version": "1.0.0",
+  "description": "A multimodal, human-like AI companion powered by Google Gemini.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "discord",
+    "gemini",
+    "ai",
+    "node"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@google/genai": "^0.15.0",
+    "discord.js": "^14.17.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mongoose": "^8.5.2",
+    "node-fetch": "^2.7.0"
+  }
+}
