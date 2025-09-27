@@ -3,32 +3,34 @@ import mongoose from 'mongoose';
 
 // --- MongoDB Schema for Conversation History ---
 const ConversationSchema = new mongoose.Schema({
-    // Server ID where the message was sent (for server-based memory)
+    // Discord message ID is crucial for editing messages
+    messageId: { type: String, unique: true, sparse: true }, 
     serverId: { type: String, required: true },
-    // User ID who sent the message (for user-based memory)
     userId: { type: String, required: true },
-    // The message text
     content: { type: String, required: true },
-    // Role (user or model)
     role: { type: String, required: true, enum: ['user', 'model'] },
-    // Timestamp for retrieval/sorting
     timestamp: { type: Date, default: Date.now },
-    // File parts for multimodal context storage (optional, for retrieval reference)
     fileParts: [{
         mimeType: String,
-        fileUri: String // Stores the Gemini File URI (e.g., files/...)
+        fileUri: String
     }]
 });
-// A compound index to quickly fetch history for a specific user in a specific server/DM
 ConversationSchema.index({ serverId: 1, userId: 1, timestamp: -1 });
 const Conversation = mongoose.model('Conversation', ConversationSchema);
 
-// --- MongoDB Schema for Bot Active Status ---
+// --- MongoDB Schema for Bot Active Status (Unchanged logic) ---
 const BotStatusSchema = new mongoose.Schema({
-    serverId: { type: String, required: true, unique: true }, // Unique per server
-    isActive: { type: Boolean, default: true } // Bot is active by default
+    serverId: { type: String, required: true, unique: true },
+    isActive: { type: Boolean, default: true }
 });
 const BotStatus = mongoose.model('BotStatus', BotStatusSchema);
+
+// --- MongoDB Schema for Ignored Messages Tracking ---
+const IgnoredMessagesSchema = new mongoose.Schema({
+    serverId: { type: String, required: true, unique: true },
+    count: { type: Number, default: 0 }, // Number of consecutive ignored messages
+});
+const IgnoredMessages = mongoose.model('IgnoredMessages', IgnoredMessagesSchema);
 
 
 /**
@@ -41,9 +43,7 @@ async function connectDB() {
         return;
     }
     try {
-        await mongoose.connect(mongoUri, {
-            // Options are generally handled automatically by modern Mongoose
-        });
+        await mongoose.connect(mongoUri, {});
         console.log('MongoDB connected successfully.');
     } catch (error) {
         console.error('MongoDB connection error:', error);
@@ -52,16 +52,12 @@ async function connectDB() {
 
 /**
  * Saves a message (user or model) to the conversation history.
- * @param {string} serverId - The ID of the server or 'DM' for a direct message.
- * @param {string} userId - The ID of the user.
- * @param {string} content - The text content of the message.
- * @param {string} role - The role ('user' or 'model').
- * @param {Array<Object>} [fileParts=[]] - Array of file part objects from multimodal messages.
  */
-async function saveMessage(serverId, userId, content, role, fileParts = []) {
+async function saveMessage(serverId, userId, content, role, messageId = null, fileParts = []) {
     if (!mongoose.connection.readyState) return;
     try {
         const newMessage = new Conversation({
+            messageId,
             serverId,
             userId,
             content,
@@ -75,34 +71,41 @@ async function saveMessage(serverId, userId, content, role, fileParts = []) {
 }
 
 /**
- * Retrieves conversation history for context. It fetches the 20 most recent messages,
- * and then optionally searches for a relevant older message to enable "personal context".
- * @param {string} serverId - The ID of the server or 'DM'.
- * @param {string} userId - The ID of the user.
- * @param {string} currentPrompt - The user's latest prompt for relevance check.
- * @returns {Array<Object>} - An array of message parts structured for the Gemini API.
+ * Edits a user message in the database when the user edits their Discord message.
+ */
+async function editMessage(messageId, newContent) {
+    if (!mongoose.connection.readyState) return;
+    try {
+        // Find the conversation entry by the stored Discord message ID and update content/timestamp
+        await Conversation.updateOne({ messageId: messageId }, { $set: { content: newContent, timestamp: new Date() } });
+        console.log(`Edited message ${messageId} in DB.`);
+    } catch (error) {
+        console.error('Error editing message in DB:', error);
+    }
+}
+
+/**
+ * Retrieves conversation history for context (includes personal context logic).
  */
 async function getConversationHistory(serverId, userId, currentPrompt) {
     if (!mongoose.connection.readyState) return [];
 
     let history = [];
     try {
-        // 1. Fetch the 20 most recent messages (sliding window)
+        // Fetch 20 most recent messages + logic for retrieving one old relevant message (personal context)
         const recentMessages = await Conversation.find({
             $or: [
-                { userId: userId, serverId: serverId }, // Current server/DM context
-                { userId: userId, serverId: { $ne: serverId } } // User's context across other servers/DMs (for personal context)
+                { userId: userId, serverId: serverId }, 
+                { userId: userId, serverId: { $ne: serverId } }
             ]
         })
         .sort({ timestamp: -1 })
         .limit(20)
         .lean();
         
-        // 2. Simple retrieval of a single potentially relevant OLD message (Personal Context)
         let oldestTimestamp = recentMessages.length > 0 ? recentMessages[recentMessages.length - 1].timestamp : new Date();
         
         if (recentMessages.length === 20) {
-            // Find words longer than 3 characters to use as keywords
             const keywords = currentPrompt.split(/\s+/).filter(w => w.length > 3).join('|'); 
             
             if (keywords.length > 0) {
@@ -111,23 +114,18 @@ async function getConversationHistory(serverId, userId, currentPrompt) {
                     timestamp: { $lt: oldestTimestamp },
                     content: { $regex: keywords, $options: 'i' }
                 })
-                .sort({ timestamp: -1 }) // Get the most recent match from the old messages
+                .sort({ timestamp: -1 })
                 .lean();
 
                 if (oldRelevantMessage) {
-                    recentMessages.unshift(oldRelevantMessage); // Add it to the beginning of the context
-                    console.log(`[DB] Retrieved old relevant context for user ${userId}.`);
+                    recentMessages.unshift(oldRelevantMessage);
                 }
             }
         }
         
-        // Convert history into Gemini API format (role/text/inlineData parts)
-        // Reverse order to be chronological (oldest first)
         history = recentMessages.reverse().map(msg => ({
             role: msg.role === 'user' ? 'user' : 'model',
             parts: [{ text: msg.content }]
-            // Note: File parts are not retrieved here as the Gemini File API has a short expiry.
-            // A complete solution would re-upload files or use a custom storage.
         }));
     } catch (error) {
         console.error('Error retrieving conversation history:', error);
@@ -136,61 +134,76 @@ async function getConversationHistory(serverId, userId, currentPrompt) {
     return history;
 }
 
-/**
- * Resets the conversation history for a specific server/user context.
- * @param {string} serverId - The ID of the server or 'DM'.
- * @param {string} userId - The ID of the user.
- */
-async function resetHistory(serverId, userId) {
+// --- Ignored Messages Tracking Functions ---
+async function incrementIgnoredCount(serverId) {
     if (!mongoose.connection.readyState) return;
     try {
-        await Conversation.deleteMany({ serverId: serverId, userId: userId });
-        console.log(`History cleared for user ${userId} in ${serverId}.`);
+        const result = await IgnoredMessages.findOneAndUpdate(
+            { serverId: serverId },
+            { $inc: { count: 1 } },
+            { upsert: true, new: true }
+        );
+        return result.count;
     } catch (error) {
-        console.error('Error resetting history:', error);
+        return 0;
     }
 }
 
-/**
- * Sets the active status of the bot for a given server.
- * @param {string} serverId - The ID of the server or 'DM'.
- * @param {boolean} isActive - The new status.
- */
+async function resetIgnoredCount(serverId) {
+    if (!mongoose.connection.readyState) return;
+    try {
+        await IgnoredMessages.updateOne(
+            { serverId: serverId },
+            { $set: { count: 0 } }
+        );
+    } catch (error) {
+        // Log errors but don't stop the flow
+    }
+}
+
+async function getIgnoredCount(serverId) {
+    if (!mongoose.connection.readyState) return 0;
+    try {
+        const doc = await IgnoredMessages.findOne({ serverId: serverId });
+        return doc ? doc.count : 0;
+    } catch (error) {
+        return 0;
+    }
+}
+
+// Bot Status functions (unchanged)
 async function setBotActiveStatus(serverId, isActive) {
     if (!mongoose.connection.readyState) return;
     try {
         await BotStatus.findOneAndUpdate(
             { serverId: serverId },
             { isActive: isActive },
-            { upsert: true, new: true } // Create if not exists, return new doc
+            { upsert: true, new: true }
         );
-        console.log(`Bot status set to ${isActive ? 'Active' : 'Inactive'} for ${serverId}.`);
     } catch (error) {
         console.error('Error setting bot status:', error);
     }
 }
 
-/**
- * Gets the active status of the bot for a given server. Defaults to active (true).
- * @param {string} serverId - The ID of the server or 'DM'.
- * @returns {boolean} - The active status.
- */
 async function getBotActiveStatus(serverId) {
-    if (!mongoose.connection.readyState) return true; // Default to active if DB is down
+    if (!mongoose.connection.readyState) return true;
     try {
         const statusDoc = await BotStatus.findOne({ serverId: serverId });
-        return statusDoc ? statusDoc.isActive : true; // Default to true if no status is found
+        return statusDoc ? statusDoc.isActive : true;
     } catch (error) {
-        console.error('Error getting bot status:', error);
-        return true; // Default to active on error
+        return true;
     }
 }
+
 
 export {
     connectDB,
     saveMessage,
+    editMessage, // NEW
     getConversationHistory,
-    resetHistory,
     setBotActiveStatus,
-    getBotActiveStatus
+    getBotActiveStatus,
+    incrementIgnoredCount, // NEW
+    resetIgnoredCount,     // NEW
+    getIgnoredCount        // NEW
 };
