@@ -1,10 +1,14 @@
 // index.js
-const { Client, GatewayIntentBits, Partials, SlashCommandBuilder, Routes, AttachmentBuilder } = require('discord.js');
-const { REST } = require('@discordjs/rest');
-const express = require('express');
-const { initGemini, processAndUploadFile, generateText, generateImage } = require('./src/geminiService');
-const { connectDB, saveMessage, getConversationHistory, resetHistory } = require('./src/dbService');
-const { log } = require('console');
+import { Client, GatewayIntentBits, Partials, SlashCommandBuilder, Routes, AttachmentBuilder } from 'discord.js';
+import { REST } from '@discordjs/rest';
+import express from 'express';
+import { log } from 'console';
+// Convert require() to import and add .js extensions for local files
+import { initGemini, processAndUploadFile, generateText, generateImage, geminiClient } from './geminiService.js'; 
+import { connectDB, saveMessage, getConversationHistory, resetHistory } from './dbService.js'; 
+// Use 'import 'dotenv/config'' to initialize process.env in an ESM project
+import 'dotenv/config'; 
+
 
 // --- Configuration ---
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
@@ -40,127 +44,136 @@ app.listen(PORT, () => console.log(`Express server listening on port ${PORT}`));
 const commands = [
     new SlashCommandBuilder()
         .setName('start')
-        .setDescription('Starts a new conversation with Son Goku and clears your previous context.'),
-    new SlashCommandBuilder()
-        .setName('stop')
-        .setDescription('Ends the current conversation with Son Goku and clears your context.'),
+        .setDescription('Starts a new conversation, clearing the memory for this channel.'),
     new SlashCommandBuilder()
         .setName('imagine')
-        .setDescription('Generates an image from a prompt (powered by gemini-2.5-flash-image-preview).')
+        .setDescription('Creates an image based on the provided prompt.')
         .addStringOption(option =>
             option.setName('prompt')
-                .setDescription('The text prompt to generate the image from.')
+                .setDescription('The detailed prompt for the image you want to create.')
                 .setRequired(true)),
-].map(command => command.toJSON());
+    new SlashCommandBuilder()
+        .setName('help')
+        .setDescription('Displays a list of commands and information.')
+]
 
-// --- Register Slash Commands ---
+// --- Command Registration (on ready) ---
 client.on('ready', async () => {
-    console.log(`Logged in as ${client.user.tag}!`);
+    log(`Logged in as ${client.user.tag}!`);
 
-    // Use a REST client to deploy the commands globally (or per-guild for faster updates)
+    // Register slash commands globally
     const rest = new REST({ version: '10' }).setToken(DISCORD_BOT_TOKEN);
-
     try {
-        console.log('Started refreshing application (/) commands.');
-        // Set up commands globally
         await rest.put(
             Routes.applicationCommands(DISCORD_CLIENT_ID),
             { body: commands },
         );
-        console.log('Successfully reloaded application (/) commands.');
+        log('Successfully registered application commands.');
     } catch (error) {
         console.error(error);
     }
 });
 
-// --- Command Handling ---
+// --- Command Interaction Handler ---
 client.on('interactionCreate', async interaction => {
-    if (!interaction.isChatInputCommand()) return;
+    if (!interaction.isCommand()) return;
 
-    const { commandName, user, channel } = interaction;
+    const { commandName } = interaction;
+    const userId = interaction.user.id;
     const serverId = interaction.guildId || 'DM'; // Use 'DM' for direct messages
-    const userId = user.id;
 
-    await interaction.deferReply(); // Show "Bot is thinking..."
+    if (commandName === 'start') {
+        await interaction.deferReply({ ephemeral: true });
+        await resetHistory(serverId, userId);
+        await interaction.editReply('Conversation history cleared. Ready for a new chat!');
+    } else if (commandName === 'imagine') {
+        await interaction.deferReply();
+        const prompt = interaction.options.getString('prompt');
+        
+        const imageUrl = await generateImage(prompt);
 
-    switch (commandName) {
-        case 'start':
-            await resetHistory(serverId, userId);
-            await interaction.editReply(`Hi there, I'm Son Goku! Your chat history here has been cleared. Let's start fresh! What's on your mind?`);
-            break;
-
-        case 'stop':
-            await resetHistory(serverId, userId);
-            await interaction.editReply(`Conversation ended. Your context has been cleared, and I'll forget what we talked about for now. Thanks for chatting!`);
-            break;
-
-        case 'imagine':
-            const prompt = interaction.options.getString('prompt');
-            await interaction.editReply(`Okay, I'm powering up to generate an image for **"${prompt}"**! Give me a few seconds...`);
-
-            const imageUrl = await generateImage(prompt);
-
-            if (imageUrl) {
-                // Remove the 'data:image/png;base64,' prefix for Discord
+        if (imageUrl) {
+            try {
+                // Image URL is a data: URL, we need to convert it to an Attachment
                 const base64Data = imageUrl.split(',')[1];
                 const buffer = Buffer.from(base64Data, 'base64');
-                const attachment = new AttachmentBuilder(buffer, { name: 'goku_image.png' });
+                const attachment = new AttachmentBuilder(buffer, { name: 'generated-image.png' });
 
-                await interaction.editReply({
-                    content: `Here is the image for: **"${prompt}"**! Pretty cool, huh?`,
-                    files: [attachment]
+                await interaction.editReply({ 
+                    content: `**Prompt:** *${prompt}*`, 
+                    files: [attachment] 
                 });
-            } else {
-                await interaction.editReply('Oops, I couldn\'t generate that image right now. Something went wrong with my power-up!');
+            } catch (error) {
+                console.error('Error handling image reply:', error);
+                await interaction.editReply('Sorry, I generated an image but ran into an error sending it to Discord.');
             }
-            break;
+        } else {
+            await interaction.editReply('Sorry, I could not generate an image with that prompt.');
+        }
+
+    } else if (commandName === 'help') {
+        await interaction.reply({
+            content: "I am Son Goku, a multimodal AI companion powered by Google Gemini. Mention me in any channel, or use my slash commands!\n\n**Commands:**\n`/start`: Clears your conversation history for this channel/DM and starts a new one.\n`/imagine <prompt>`: Generates an image based on your prompt.\n`/help`: Shows this message.\n\n**Note:** To give me context from attachments, simply include a file in your message when you mention me. I can see images, PDFs, text files, and more!",
+            ephemeral: true
+        });
     }
 });
 
-// --- Message Handling (Main Chat Logic) ---
+// --- Message Handler (The main AI logic) ---
 client.on('messageCreate', async message => {
-    // Ignore messages from bots, DMs (unless explicitly targeted later), and non-prefix messages
-    if (message.author.bot || !message.content.startsWith(`<@${client.user.id}>`)) return;
+    // 1. Pre-checks (Ignore bots, DMs/Mentions only)
+    if (message.author.bot) return;
 
-    const serverId = message.guildId || 'DM';
+    // Determine the context (DM or Guild Channel)
+    const isDM = message.channel.type === 1; // DM Channel type
+    const serverId = message.guildId || 'DM'; // Use 'DM' for direct messages
     const userId = message.author.id;
-    const rawPrompt = message.content.replace(`<@${client.user.id}>`, '').trim();
 
-    if (!rawPrompt) {
-        message.reply("You called my name, but didn't say anything! What's up?");
-        return;
-    }
-    
-    // 1. Multimodal File Handling
-    let fileParts = [];
-    let filesToCleanup = []; // Array to store Gemini File Objects for deletion
-    
-    // Check for file attachments
-    const attachments = Array.from(message.attachments.values());
+    // Check if the bot was mentioned in a server or it's a DM
+    const mentioned = message.mentions.has(client.user.id);
 
-    for (const attachment of attachments) {
-        try {
-            // Process the attachment: download from Discord, upload to Gemini Files API
-            const { file, filePart } = await processAndUploadFile(attachment.url, attachment.contentType);
-            fileParts.push(filePart);
-            filesToCleanup.push(file); // Store file to delete after response
-        } catch (error) {
-            console.error('Error processing attachment:', error);
-            message.reply(`I had trouble processing the file: ${attachment.name}. I'll try to answer your text prompt without it.`);
+    if (!isDM && !mentioned) return;
+
+    // If mentioned, remove the mention from the message content to get the clean prompt
+    const rawPrompt = mentioned
+        ? message.content.replace(`<@${client.user.id}>`, '').trim()
+        : message.content.trim();
+
+    // Ignore empty messages (e.g., just a file upload with a mention)
+    if (!rawPrompt && message.attachments.size === 0) return;
+    
+    // 2. Process Attachments
+    const filesToCleanup = [];
+    const fileParts = [];
+
+    for (const [key, attachment] of message.attachments) {
+        // Only process files if they have a URL and a known mimeType
+        if (attachment.url && attachment.contentType) {
+            try {
+                // Process and upload the file to Gemini Files API
+                const { file, filePart } = await processAndUploadFile(attachment.url, attachment.contentType);
+                filesToCleanup.push(file);
+                fileParts.push(filePart);
+                console.log(`Attached file processed: ${file.displayName}`);
+            } catch (error) {
+                console.error(`Error processing attachment ${attachment.name}:`, error.message);
+                // Optionally reply to the user that the file couldn't be processed
+                // await message.reply(`Warning: Could not process file ${attachment.name}. The response will be based only on text.`);
+            }
         }
     }
-
-    // 2. Typing Simulation (Realistic Delay)
-    // We base the typing time on the expected model (flash-lite for short, flash for long)
-    const isShortQuery = rawPrompt.length < 50 && fileParts.length === 0;
-    const maxTypingDelay = isShortQuery ? 2000 : 8000; // 2s for lite, up to 8s for flash
-    const typingStartTime = Date.now();
-    const typingInterval = setInterval(() => {
-        // Stop typing after the maximum delay, if the response hasn't arrived
-        if (Date.now() - typingStartTime > maxTypingDelay) {
-            clearInterval(typingInterval);
-        } else {
-            message.channel.sendTyping().catch(console.error); // Send typing indicator
+    
+    // --- Core Interaction Logic ---
+    let typingInterval = null;
+    let typingStartTime = Date.now();
+    
+    // Start typing indicator
+    await message.channel.sendTyping();
+    typingInterval = setInterval(() => {
+        try {
+            message.channel.sendTyping(); // Refresh typing indicator
+        } catch (e) {
+            // Channel might have closed, stop refreshing indicator
         }
     }, 5000); // Discord only allows typing indicator for 10 seconds, so refresh it often
 
@@ -204,4 +217,5 @@ client.on('messageCreate', async message => {
     }
 });
 
+// --- Login ---
 client.login(DISCORD_BOT_TOKEN);
