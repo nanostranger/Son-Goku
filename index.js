@@ -1,16 +1,27 @@
 // index.js
-import { Client, GatewayIntentBits, Partials, SlashCommandBuilder, Routes, AttachmentBuilder, PermissionsBitField } from 'discord.js';
+import { 
+    Client, GatewayIntentBits, Partials, SlashCommandBuilder, Routes, 
+    AttachmentBuilder, PermissionsBitField, ActivityType, 
+    Guild 
+} from 'discord.js';
 import { REST } from '@discordjs/rest';
 import express from 'express';
-import { initGemini, processAndUploadFile, generateText, generateImage, geminiClient } from './src/geminiService.js';
-import { connectDB, saveMessage, getConversationHistory, resetHistory, setBotActiveStatus, getBotActiveStatus } from './src/dbService.js';
+import { 
+    initGemini, processAndUploadFile, generateText, generateImage, 
+    geminiClient, decideToReply 
+} from './src/geminiService.js';
+import { 
+    connectDB, saveMessage, getConversationHistory, setBotActiveStatus, 
+    getBotActiveStatus, editMessage, incrementIgnoredCount, resetIgnoredCount, 
+    getIgnoredCount 
+} from './src/dbService.js';
 import { log } from 'console';
 
 // --- Configuration ---
-// Note: This bot expects environment variables DISCORD_BOT_TOKEN, DISCORD_CLIENT_ID, and PORT.
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const PORT = process.env.PORT || 3000;
+const MAX_IGNORE_COUNT = 3; // Reply after 3 ignored messages
 
 // Discord Client Setup
 const client = new Client({
@@ -18,10 +29,14 @@ const client = new Client({
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.DirectMessages,
-        GatewayIntentBits.MessageContent, // Required for reading message content
+        GatewayIntentBits.MessageContent, 
+        GatewayIntentBits.GuildMembers, 
     ],
     partials: [Partials.Channel, Partials.Message],
 });
+
+// Cache to prevent race conditions and manage channel locks during replies
+const isBotResponding = new Map(); 
 
 // Initialize services
 connectDB();
@@ -37,10 +52,10 @@ const app = express();
 app.get('/', (req, res) => res.send('Son Goku Bot is running!'));
 app.listen(PORT, () => console.log(`Express server listening on port ${PORT}`));
 
+// --- Utility Functions ---
+
 /**
  * Splits a response into multiple messages if it exceeds Discord's 2000 character limit.
- * @param {string} text The full text response.
- * @returns {Array<string>} An array of message strings.
  */
 function splitLongResponse(text) {
     const MAX_LENGTH = 2000;
@@ -49,10 +64,9 @@ function splitLongResponse(text) {
         messages.push(text);
         return messages;
     }
-
+    // ... (Splitting logic remains the same for robustness)
     let currentText = text;
     while (currentText.length > 0) {
-        // Find a natural break (newline or sentence end) near the limit
         let chunk = currentText.substring(0, MAX_LENGTH);
         let splitIndex = MAX_LENGTH;
 
@@ -60,11 +74,12 @@ function splitLongResponse(text) {
             let lastNewline = chunk.lastIndexOf('\n');
             let lastSentenceEnd = Math.max(chunk.lastIndexOf('.'), chunk.lastIndexOf('!'), chunk.lastIndexOf('?'));
 
-            // Prioritize newline, then sentence end, otherwise just split at MAX_LENGTH
             if (lastNewline !== -1 && MAX_LENGTH - lastNewline < 100) {
                 splitIndex = lastNewline + 1;
             } else if (lastSentenceEnd !== -1 && MAX_LENGTH - lastSentenceEnd < 100) {
                 splitIndex = lastSentenceEnd + 1;
+            } else {
+                splitIndex = MAX_LENGTH;
             }
         } else {
             splitIndex = currentText.length;
@@ -76,190 +91,305 @@ function splitLongResponse(text) {
     return messages.filter(m => m.length > 0);
 }
 
-// --- Slash Command Definitions ---
+/**
+ * Calculates the typing duration based on response length for realism (New Logic).
+ */
+function calculateTypingDelay(responseText) {
+    const length = responseText.length;
+    if (length < 100) return 2000; // 2 seconds for simple replies
+    if (length < 500) return 4000; // 4 seconds for longer context
+    if (length < 1000) return 5000; // 5 seconds for medium length
+    return 8000; // 8 seconds for very long
+}
+
+/**
+ * Ensures the 'KAKAROT' role exists and is created if missing (New Logic).
+ */
+async function ensureKakarotRole(guild) {
+    const ROLE_NAME = 'KAKAROT';
+    const ROLE_COLOR = 'YELLOW';
+    
+    // Check if the role already exists
+    let kakarotRole = guild.roles.cache.find(role => role.name === ROLE_NAME);
+    
+    if (!kakarotRole) {
+        try {
+            kakarotRole = await guild.roles.create({
+                name: ROLE_NAME,
+                color: ROLE_COLOR,
+                reason: 'Son Goku requires a role to mark his presence.',
+                permissions: [],
+            });
+            console.log(`Successfully created KAKAROT role in ${guild.name}.`);
+        } catch (error) {
+            console.error(`Failed to create KAKAROT role in ${guild.name}:`, error.message);
+        }
+    }
+}
+
+// --- Slash Command Definitions (Updated descriptions/replies) ---
 const commands = [
     new SlashCommandBuilder()
         .setName('start')
-        .setDescription('Make Son Goku active and ready to chat.')
-        // Require the user to have the 'Manage Server' permission
+        .setDescription('Ready to fight! Makes Goku active to chat with everyone.')
         .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild), 
     new SlashCommandBuilder()
         .setName('stop')
-        .setDescription('Make Son Goku quiet and inactive.')
-        // Require the user to have the 'Manage Server' permission
+        .setDescription('I\'m tired now, I go to sleep. Makes Goku quiet and inactive.')
         .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild), 
     new SlashCommandBuilder()
         .setName('imagine')
-        .setDescription('Generates an image from a prompt.')
+        .setDescription('Power up and create an epic image! (Uses AI to generate a picture)')
         .addStringOption(option =>
             option.setName('prompt')
-                .setDescription('The text prompt to generate the image from.')
+                .setDescription('What kind of epic scene do you want to imagine?')
                 .setRequired(true)),
 ].map(command => command.toJSON());
 
-// --- Register Slash Commands ---
+// --- Register Slash Commands & Bot Activity ---
 client.on('ready', async () => {
     console.log(`Logged in as ${client.user.tag}!`);
 
-    // Use a REST client to deploy the commands globally
-    const rest = new REST({ version: '10' }).setToken(DISCORD_BOT_TOKEN);
+    // Set Bot Activity: Cycle between status messages (New Logic)
+    const activities = [
+        { name: 'Kame Hame Ha!', type: ActivityType.Playing },
+        { name: 'Training with Vegeta', type: ActivityType.Playing },
+        { name: 'Searching for Dragon Balls', type: ActivityType.Watching },
+        { name: 'Eating a Senzu Bean', type: ActivityType.Custom },
+    ];
+    let activityIndex = 0;
+    
+    setInterval(() => {
+        const activity = activities[activityIndex];
+        client.user.setActivity(activity.name, { type: activity.type });
+        activityIndex = (activityIndex + 1) % activities.length;
+    }, 15000); // Change activity every 15 seconds
 
+    // Hourly check for KAKAROT role across all guilds (New Logic)
+    setInterval(() => {
+        for (const guild of client.guilds.cache.values()) {
+            ensureKakarotRole(guild).catch(console.error);
+        }
+    }, 3600000); // 1 hour
+
+    // Deploy Commands
+    const rest = new REST({ version: '10' }).setToken(DISCORD_BOT_TOKEN);
     try {
-        console.log('Started refreshing application (/) commands.');
-        // Set up commands globally
         await rest.put(
             Routes.applicationCommands(DISCORD_CLIENT_ID),
             { body: commands },
         );
         console.log('Successfully reloaded application (/) commands.');
     } catch (error) {
-        console.error(error);
+        console.error('Failed to deploy slash commands:', error);
     }
 });
 
-// --- Command Handling ---
+// --- Welcome Message & Role Check on Guild Join (New Logic) ---
+client.on('guildCreate', async guild => {
+    console.log(`Joined a new guild: ${guild.name} (ID: ${guild.id})`);
+
+    await ensureKakarotRole(guild);
+
+    const channel = guild.channels.cache.find(c => 
+        c.type === 0 && 
+        c.permissionsFor(guild.members.me).has(PermissionsBitField.Flags.SendMessages)
+    );
+
+    if (channel) {
+        channel.send(`Hey there, buddies! I'm Son Goku, and I'm ready to hang out and maybe even have a little chat! I can talk, generate images, and I've got my eye on the latest gossip. Just **@mention** me to start a conversation! Let's power up this server!`);
+    }
+});
+
+// --- Command Handling (Updated replies) ---
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
-    const { commandName, user, channel } = interaction;
-    // serverId is used as a key for bot activity status and DB history
+    const { commandName } = interaction;
     const serverId = interaction.guildId || 'DM'; 
-    const userId = user.id;
 
-    await interaction.deferReply(); // Show "Bot is thinking..."
+    await interaction.deferReply(); 
 
     switch (commandName) {
         case 'start':
             await setBotActiveStatus(serverId, true);
-            await interaction.editReply(`Hi there, I'm Son Goku! I'm active and ready to chat. This command did **not** clear your history.`);
+            await interaction.editReply(`Alright, I'm powered up and ready to go! Let's chat, buddy! What's the plan?`);
             break;
 
         case 'stop':
             await setBotActiveStatus(serverId, false);
-            await interaction.editReply(`Gotta take a break! I'm now inactive and won't respond to messages until a moderator uses the /start command. Your context remains saved.`);
+            await interaction.editReply(`Whew, that was a good run! I'm gonna take a nap and won't respond until a moderator wakes me up. See ya later!`);
+            // Reset ignored messages when manually stopped
+            await resetIgnoredCount(serverId);
             break;
             
         case 'imagine':
             const prompt = interaction.options.getString('prompt');
-            await interaction.editReply(`Okay, I'm powering up to generate an image for **"${prompt}"**! Give me a few seconds...`);
+            await interaction.editReply(`Okay, stand back! I'm channeling my energy to generate a super-awesome image for **"${prompt}"**! Don't blink!`);
 
             const imageUrl = await generateImage(prompt);
 
             if (imageUrl) {
-                // Remove the 'data:image/png;base64,' prefix for Discord
                 const base64Data = imageUrl.split(',')[1];
                 const buffer = Buffer.from(base64Data, 'base64');
                 const attachment = new AttachmentBuilder(buffer, { name: 'goku_image.png' });
                 await interaction.editReply({
-                    content: `Here is the image for: **"${prompt}"**! Pretty cool, huh?`,
+                    content: `Here is the image for: **"${prompt}"**! Looks epic, huh?!`,
                     files: [attachment]
                 });
             } else {
-                await interaction.editReply('Oops, I couldn\'t generate that image right now. Something went wrong with my power-up!');
+                await interaction.editReply('Oops, I couldn\'t generate that image right now. My energy ran out! Try a simpler prompt, pal!');
             }
             break;
     }
 });
 
+// --- Message Edit Handler (Updates DB) ---
+client.on('messageUpdate', async (oldMessage, newMessage) => {
+    // Only process user messages with content changes
+    if (newMessage.author.bot || oldMessage.content === newMessage.content) return;
+
+    // Use the messageId to update the content in the database
+    await editMessage(newMessage.id, newMessage.content);
+    console.log(`[DB] Updated edited message ${newMessage.id}.`);
+});
+
 // --- Message Handling (Main Chat Logic) ---
 client.on('messageCreate', async message => {
-    // Ignore messages from bots or non-mention messages
-    if (message.author.bot || !message.content.startsWith(`<@${client.user.id}>`)) return;
+    if (message.author.bot || !message.inGuild() && !message.channel.isDMBased()) return;
 
     const serverId = message.guildId || 'DM';
     const userId = message.author.id;
-    const rawPrompt = message.content.replace(`<@${client.user.id}>`, '').trim();
+    const isTagged = message.content.startsWith(`<@${client.user.id}>`);
+    const rawPrompt = isTagged ? message.content.replace(`<@${client.user.id}>`, '').trim() : message.content.trim();
 
-    // Check bot's active status
+    // 1. Check Bot Activity (Stop/Start command status)
     const isBotActive = await getBotActiveStatus(serverId);
-    if (!isBotActive) return; // Do not respond if the bot is stopped
+    if (!isBotActive) return;
 
-    if (!rawPrompt) {
-        message.reply("You called my name, but didn't say anything! What's up?");
+    // 2. Check for empty prompt after mention
+    if (isTagged && !rawPrompt) {
+        message.reply("You called my name, but didn't say anything! What's up, buddy?");
         return;
     }
     
-    // 1. Multimodal File Handling
-    let fileParts = [];
-    let filesToCleanup = []; // Array to store Gemini File Objects for deletion
-    
-    // Check for file attachments
-    const attachments = Array.from(message.attachments.values());
+    // 3. Untagged Message Decision Logic (New Logic)
+    let shouldReply = isTagged;
+    let ignoreCount = 0;
 
-    for (const attachment of attachments) {
-        try {
-            // Process the attachment: download from Discord, upload to Gemini Files API
+    if (!isTagged) {
+        ignoreCount = await getIgnoredCount(serverId);
+        
+        if (ignoreCount >= MAX_IGNORE_COUNT) {
+            shouldReply = true;
+        } else {
+            shouldReply = await decideToReply(rawPrompt, serverId);
+        }
+    }
+
+    if (!shouldReply) {
+        // Only increment if we decided not to reply via Gemini-Lite AND didn't hit the max limit
+        if (!isTagged && ignoreCount < MAX_IGNORE_COUNT) {
+            await incrementIgnoredCount(serverId);
+        }
+        return; 
+    }
+
+    // If we're here, we need to reply. Reset count for all replies.
+    await resetIgnoredCount(serverId);
+    
+    // 4. Concurrency Check (Lock the channel to prevent overlapping replies)
+    const channelId = message.channel.id;
+    if (isBotResponding.get(channelId)) {
+        if (isTagged) {
+            message.reply("Hold on a sec, pal! I'm finishing up a thought! I'll be right with ya!");
+        }
+        return;
+    }
+    isBotResponding.set(channelId, true); // Lock the channel
+
+    // --- Main Reply Flow ---
+    let filesToCleanup = [];
+    
+    try {
+        // a. Multimodal File Handling
+        const attachments = Array.from(message.attachments.values());
+        let fileParts = [];
+        for (const attachment of attachments) {
             const { file, filePart } = await processAndUploadFile(attachment.url, attachment.contentType);
             fileParts.push(filePart);
             filesToCleanup.push(file); 
-        } catch (error) {
-            console.error('Error processing attachment:', error);
-            message.reply(`I had trouble processing the file: ${attachment.name}. I'll try to answer your text prompt without it.`);
-            // Continue to the next attachment/text prompt
         }
-    }
 
-    // 2. Typing Simulation (Realistic Delay)
-    // We base the typing time on the expected model (flash-lite for short, flash for long)
-    const isShortQuery = rawPrompt.length < 50 && fileParts.length === 0;
-    const maxTypingDelay = isShortQuery ? 2000 : 8000; // 2s for lite, up to 8s for flash
-    const typingStartTime = Date.now();
-    const typingInterval = setInterval(() => {
-        // Stop typing after the maximum delay, if the response hasn't arrived
-        if (Date.now() - typingStartTime > maxTypingDelay) {
-            clearInterval(typingInterval);
-        } else {
-            message.channel.sendTyping().catch(console.error); // Send typing indicator
+        // b. Retrieve Context
+        const history = await getConversationHistory(serverId, userId, rawPrompt);
+
+        // c. Generate Response
+        const { text: responseText, sources, isShort } = await generateText(history, rawPrompt, fileParts);
+
+        // d. Typing Simulation & Locking
+        const typingDelay = calculateTypingDelay(responseText);
+        const typingStartTime = Date.now();
+        const typingInterval = setInterval(() => {
+            message.channel.sendTyping().catch(console.error);
+        }, 5000); 
+
+        // Wait for the response to arrive + ensure minimum typing time
+        const elapsed = Date.now() - typingStartTime;
+        if (elapsed < typingDelay) {
+            await new Promise(resolve => setTimeout(resolve, typingDelay - elapsed));
         }
-    }, 5000); 
+        clearInterval(typingInterval);
+        
+        // e. Response Splitting (Goku sometimes replies in two messages - 5% chance)
+        let responseMessages = splitLongResponse(responseText);
+        const splitChance = Math.random() < 0.05;
 
-    // 3. Retrieve Context (including personal context logic)
-    const history = await getConversationHistory(serverId, userId, rawPrompt);
+        if (responseMessages.length === 1 && splitChance && responseText.length > 50) {
+            const text = responseMessages[0];
+            const midIndex = Math.floor(text.length / 2);
+            const splitPoint = text.lastIndexOf('.', midIndex) !== -1 ? text.lastIndexOf('.', midIndex) + 1 : midIndex;
+            
+            responseMessages = [
+                text.substring(0, splitPoint).trim(),
+                text.substring(splitPoint).trim()
+            ].filter(m => m.length > 0);
+        }
 
-    // 4. Generate Response
-    const { text: responseText, sources } = await generateText(history, rawPrompt, fileParts);
-
-    // 5. Stop Typing & Send Response
-    clearInterval(typingInterval);
-    // Ensure minimum typing time for realism (2 seconds)
-    const elapsed = Date.now() - typingStartTime;
-    if (elapsed < 2000) {
-        await new Promise(resolve => setTimeout(resolve, 2000 - elapsed));
-    }
-    
-    try {
-        const responseMessages = splitLongResponse(responseText);
-
+        // f. Send Response(s)
+        let replyMessage = message;
         for (let i = 0; i < responseMessages.length; i++) {
-            // First message is a reply, subsequent are simple sends
             if (i === 0) {
-                await message.reply(responseMessages[i]);
+                replyMessage = await replyMessage.reply({ content: responseMessages[i] });
             } else {
-                await message.channel.send(responseMessages[i]);
+                replyMessage = await message.channel.send({ content: responseMessages[i] });
             }
         }
 
-        // 6. Save both user and model messages to history
-        await saveMessage(serverId, userId, rawPrompt, 'user', fileParts.map(fp => ({
+        // g. Save both user and model messages to history, including the Discord message ID
+        await saveMessage(serverId, userId, rawPrompt, 'user', message.id, fileParts.map(fp => ({
             mimeType: fp.fileData.mimeType,
             fileUri: fp.fileData.fileUri
         })));
-        await saveMessage(serverId, userId, responseText, 'model');
+        await saveMessage(serverId, userId, responseText, 'model', replyMessage.id); 
 
     } catch (error) {
-        console.error('Error sending Discord reply or saving message:', error);
-    }
-    
-    // 7. Cleanup Gemini Files
-    for (const file of filesToCleanup) {
-        try {
-            await geminiClient.files.delete({ name: file.name });
-            console.log(`Cleaned up Gemini file: ${file.name}`);
-        } catch (error) {
-            console.warn(`Could not delete Gemini file ${file.name}:`, error.message);
+        console.error('Fatal Error during Message Processing:', error);
+        if (isTagged) {
+             message.reply("Ah, crud! Something went wrong while I was powering up that message. Try sending it again!");
+        }
+    } finally {
+        // h. Unlock channel and Cleanup Gemini Files
+        isBotResponding.delete(channelId);
+        for (const file of filesToCleanup) {
+            try {
+                await geminiClient.files.delete({ name: file.name });
+            } catch (error) {
+                console.warn(`Could not delete Gemini file ${file.name}:`, error.message);
+            }
         }
     }
 });
 
 client.login(DISCORD_BOT_TOKEN);
-    
+        
