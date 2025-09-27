@@ -1,5 +1,5 @@
 // src/dbService.js
-const mongoose = require('mongoose');
+import mongoose from 'mongoose'; // Convert require to import
 
 // --- MongoDB Schema for Conversation History ---
 const ConversationSchema = new mongoose.Schema({
@@ -35,23 +35,21 @@ async function connectDB() {
         return;
     }
     try {
-        await mongoose.connect(mongoUri, {
-            // Note: Use the options required by your Mongoose version.
-            // Modern Mongoose handles many connection options automatically.
-        });
+        // Note: Modern Mongoose handles connection options automatically.
+        await mongoose.connect(mongoUri); 
         console.log('MongoDB connected successfully.');
     } catch (error) {
-        console.error('MongoDB connection error:', error);
+        console.error('MongoDB connection failed:', error);
     }
 }
 
 /**
- * Saves a message (user or model) to the conversation history.
- * @param {string} serverId - The ID of the server or 'DM' for a direct message.
+ * Saves a message (user or model) to the database.
+ * @param {string} serverId - The ID of the server or 'DM'.
  * @param {string} userId - The ID of the user.
- * @param {string} content - The text content of the message.
- * @param {string} role - The role ('user' or 'model').
- * @param {Array<Object>} [fileParts=[]] - Array of file part objects from multimodal messages.
+ * @param {string} content - The message content.
+ * @param {string} role - 'user' or 'model'.
+ * @param {Array} fileParts - Array of file parts data (optional).
  */
 async function saveMessage(serverId, userId, content, role, fileParts = []) {
     if (!mongoose.connection.readyState) return;
@@ -65,49 +63,44 @@ async function saveMessage(serverId, userId, content, role, fileParts = []) {
         });
         await newMessage.save();
     } catch (error) {
-        console.error('Error saving message to DB:', error);
+        console.error('Error saving message:', error);
     }
 }
 
 /**
- * Retrieves conversation history for context. It fetches the 20 most recent messages,
- * and then optionally searches for a relevant older message to enable "personal context".
+ * Retrieves the conversation history for a user/server context, ensuring the context
+ * length remains manageable.
  * @param {string} serverId - The ID of the server or 'DM'.
  * @param {string} userId - The ID of the user.
- * @param {string} currentPrompt - The user's latest prompt for relevance check.
- * @returns {Array<Object>} - An array of message parts structured for the Gemini API.
+ * @param {string} rawPrompt - The user's new prompt (used for old relevant context retrieval).
+ * @returns {Array} - Array of history objects in Gemini API format.
  */
-async function getConversationHistory(serverId, userId, currentPrompt) {
+async function getConversationHistory(serverId, userId, rawPrompt) {
     if (!mongoose.connection.readyState) return [];
 
     let history = [];
     try {
-        // 1. Fetch the 20 most recent messages (sliding window)
-        const recentMessages = await Conversation.find({
-            $or: [
-                { userId: userId, serverId: serverId }, // Current server/DM context
-                { userId: userId, serverId: { $ne: serverId } } // User's context across other servers/DMs (for personal context)
-            ]
-        })
-        .sort({ timestamp: -1 })
-        .limit(20)
-        .lean();
+        // Fetch the last 15 messages for short-term memory
+        let recentMessages = await Conversation.find({ serverId: serverId, userId: userId })
+            .sort({ timestamp: -1 }) // Sort by newest first
+            .limit(15);
+        
+        // Simple logic to potentially fetch an older, highly relevant message
+        // This is a placeholder for a more advanced retrieval augmented generation (RAG) system.
+        if (recentMessages.length < 15) {
+            // Placeholder for RAG logic: For simplicity, we just check if any message contains a key phrase
+            const relevantKeywords = ['context', 'remember', 'previous', 'last time'];
+            if (relevantKeywords.some(keyword => rawPrompt.toLowerCase().includes(keyword))) {
+                // Find an older message that contains a common theme or keyword (simple example)
+                const oldestTimestamp = recentMessages.length > 0 ? recentMessages[recentMessages.length - 1].timestamp : new Date(0);
 
-        // 2. Simple retrieval of a single potentially relevant OLD message
-        // This simulates the "personal context" feature by looking for a keyword match
-        // in messages older than the 20 most recent ones.
-        let oldestTimestamp = recentMessages.length > 0 ? recentMessages[recentMessages.length - 1].timestamp : new Date();
-
-        if (recentMessages.length === 20) {
-            const keywords = currentPrompt.split(/\s+/).filter(w => w.length > 3).join('|');
-            if (keywords.length > 0) {
                 const oldRelevantMessage = await Conversation.findOne({
+                    serverId: serverId,
                     userId: userId,
-                    timestamp: { $lt: oldestTimestamp },
-                    content: { $regex: keywords, $options: 'i' }
+                    timestamp: { $lt: oldestTimestamp }, // Find messages older than the current recent batch
+                    content: { $regex: 'important|secret|name', $options: 'i' } // Look for simple relevance
                 })
-                .sort({ timestamp: -1 }) // Get the most recent match from the old messages
-                .lean();
+                .sort({ timestamp: -1 });
 
                 if (oldRelevantMessage) {
                     recentMessages.unshift(oldRelevantMessage); // Add it to the beginning of the context
@@ -147,10 +140,10 @@ async function resetHistory(serverId, userId) {
     }
 }
 
-module.exports = {
+// Convert module.exports to named exports
+export {
     connectDB,
     saveMessage,
     getConversationHistory,
     resetHistory
 };
-
