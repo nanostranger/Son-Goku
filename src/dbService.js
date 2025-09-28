@@ -360,26 +360,6 @@ async function checkAndIncrementImageUsage(userId) {
     }
 }
 
-// Optional: Cleanup function to remove old messages (call periodically)
-async function cleanupOldMessages(daysToKeep = 30) {
-    if (!mongoose.connection.readyState) return;
-    
-    try {
-        const cutoffDate = new Date();
-        cutoffDate.setDate(cutoffDate.getDate() - daysToKeep);
-        
-        const result = await Conversation.deleteMany({
-            timestamp: { $lt: cutoffDate }
-        });
-        
-        console.log(`[DB] Cleaned up ${result.deletedCount} old messages older than ${daysToKeep} days`);
-        return result.deletedCount;
-    } catch (error) {
-        console.error('Error cleaning up old messages:', error);
-        return 0;
-    }
-}
-
 export {
     connectDB,
     saveMessage,
@@ -392,6 +372,5 @@ export {
     getIgnoredCount,
     setContinuousReplyStatus,
     getContinuousReplyStatus,
-    checkAndIncrementImageUsage,
-    cleanupOldMessages
+    checkAndIncrementImageUsage
 };
