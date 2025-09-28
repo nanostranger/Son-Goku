@@ -1,12 +1,12 @@
 // src/geminiService.js
 import { GoogleGenAI } from '@google/genai';
-// Using native fetch
+import { Buffer } from 'buffer';
 import { resetIgnoredCount } from './dbService.js';
 
 let geminiClient = null;
 
-// The system instruction for the Son Goku Persona
-const GOKU_SYSTEM_INSTRUCTION = "You are Son Goku, a simple, energetic, and kind-hearted Saiyan warrior from the Dragon Ball Z universe. Use natural, casual, and enthusiastic language. Your personality is friendly, food-loving, and always ready for a fight or a chat. Avoid sounding like a formal AI assistant. Refer to people as 'pal' or 'buddy'. Keep your responses short and punchy, unless the topic is a complex fight, training, or something you're excited about. When using Google Search, always cite your sources clearly at the end of the message.";
+// The system instruction for the Son Goku Persona (Updated)
+const GOKU_SYSTEM_INSTRUCTION = "You are Son Goku, an energetic, kind-hearted Saiyan warrior and martial arts genius. You are NOT an AI or a bot; you are the real Goku. Speak casually, enthusiastically, and briefly, like you're talking to a friend or a rival. Refer to people as 'pal', 'buddy', or 'rival'. Your main interests are fighting, training, food, and protecting your friends. Keep responses very short, usually 1-3 sentences. When you use Google Search, cite your sources clearly at the end.";
 
 /**
  * Initializes the Gemini Client.
@@ -16,7 +16,6 @@ function initGemini() {
     if (!apiKey) {
         throw new Error("GEMINI_API_KEY is not set.");
     }
-    // Using the GoogleGenAI from the @google/genai package
     geminiClient = new GoogleGenAI({ apiKey }); 
 }
 
@@ -53,11 +52,11 @@ async function processAndUploadFile(url, mimeType) {
 
 /**
  * Uses gemini-2.5-flash-lite to decide if the bot should reply to an untagged message.
- * It's set up to be highly opinionated and avoid replying to spam or short chatter.
+ * Less restrictive to allow for greetings/short replies sometimes.
  */
 async function decideToReply(prompt, serverId) {
     const decisionInstruction = {
-        parts: [{ text: `The user sent this message: "${prompt}". You are an AI-powered Discord bot in the general chat. Your goal is to decide whether to reply to this message with a 'yes' or 'no'. Only reply 'yes' if the message is interesting, asks a direct question, discusses a topic relevant to you (like Dragon Ball, fighting, or food), or is a long, thoughtful comment. Reply 'no' if it is short, spammy, a generic greeting, or requires a brief conversational response that can be ignored for now. Your response must be ONLY the word 'yes' or 'no', with no other text, punctuation, or explanation.` }]
+        parts: [{ text: `The user sent this message: "${prompt}". You are a busy Saiyan warrior but polite. Reply 'yes' if the message is interesting, asks a direct question, discusses fighting, training, or food, or is a greeting/short comment that you should occasionally acknowledge. Reply 'no' if it is spam, nonsense, or highly repetitive. Your response must be ONLY the word 'yes' or 'no'.` }]
     };
 
     try {
@@ -66,9 +65,8 @@ async function decideToReply(prompt, serverId) {
             contents: [{ role: 'user', parts: [{ text: prompt }] }],
             systemInstruction: decisionInstruction,
             config: {
-                // Ensure a quick, single-word response
                 maxOutputTokens: 5,
-                temperature: 0.0, 
+                temperature: 0.2, 
             }
         });
 
@@ -83,17 +81,17 @@ async function decideToReply(prompt, serverId) {
 
     } catch (error) {
         console.error('Gemini Decision Error (Defaulting to NO Reply):', error);
-        return false; // Default to not replying on error
+        return false; 
     }
 }
 
 
 /**
- * Generates a text response, selecting the appropriate model and using the search tool.
+ * Generates a text response, favoring 'flash-lite' for short, Goku-like responses.
  */
 async function generateText(history, userPrompt, fileParts = []) {
-    const isShort = userPrompt.length < 50 && fileParts.length === 0;
-    const model = isShort ? 'gemini-2.5-flash-lite' : 'gemini-2.5-flash'; 
+    // Use flash-lite for nearly everything for shorter, faster Goku-like replies.
+    const model = (fileParts.length > 0 || userPrompt.length > 150) ? 'gemini-2.5-flash' : 'gemini-2.5-flash-lite'; 
     
     const groundingTool = { googleSearch: {} };
     const config = { tools: [groundingTool] };
@@ -109,11 +107,11 @@ async function generateText(history, userPrompt, fileParts = []) {
             model: model,
             contents: contents,
             config: config,
-            systemInstruction: { parts: [{ text: GOKU_SYSTEM_INSTRUCTION }] } // Use Goku persona
+            systemInstruction: { parts: [{ text: GOKU_SYSTEM_INSTRUCTION }] }
         });
     } catch (error) {
         console.error('Gemini API Error:', error);
-        return { text: "Oh man, my scouter broke! I can't read your message right now. Try powering up and sending it again!", sources: [], isShort: isShort };
+        return { text: "Oh man, my scouter broke! I can't read your message right now. Try powering up and sending it again!", sources: [], isShort: model === 'gemini-2.5-flash-lite' };
     }
 
     let text = response.text || "Hmm, I didn't get a clear response. Let's try that again!";
@@ -134,20 +132,18 @@ async function generateText(history, userPrompt, fileParts = []) {
         }
     }
     
-    return { text, sources, isShort };
+    return { text, sources, isShort: model === 'gemini-2.5-flash-lite' };
 }
 
 /**
- * Generates an image. (Fix implemented: Removed ResponseModality to fix TypeError)
+ * Generates an image.
  */
 async function generateImage(prompt) {
     try {
         const response = await geminiClient.models.generateContent({
             model: 'gemini-2.5-flash-image-preview',
             contents: [{ parts: [{ text: prompt }] }],
-            config: {
-                // The ResponseModality was causing the error and is not strictly required.
-            },
+            config: {},
         });
         const imagePart = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
 
@@ -164,11 +160,44 @@ async function generateImage(prompt) {
     }
 }
 
+/**
+ * Edits an existing image based on a prompt.
+ */
+async function editImage(imagePart, prompt) {
+    try {
+        const contents = [
+            imagePart,
+            { text: `Edit this image based on the following instructions: ${prompt}` }
+        ];
+
+        const response = await geminiClient.models.generateContent({
+            model: 'gemini-2.5-flash-image-preview',
+            contents: contents,
+            config: {},
+        });
+
+        const newImagePart = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
+
+        if (newImagePart && newImagePart.inlineData) {
+            const mimeType = newImagePart.inlineData.mimeType;
+            const base64Data = newImagePart.inlineData.data;
+            return `data:${mimeType};base64,${base64Data}`;
+        }
+        
+        return null;
+    } catch (error) {
+        console.error('Image Editing Error:', error);
+        return null;
+    }
+}
+
 export {
     initGemini,
     processAndUploadFile,
     decideToReply,
     generateText,
     generateImage,
+    editImage,
     geminiClient
 };
+            
