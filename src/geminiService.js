@@ -1,11 +1,39 @@
-// src/geminiService.js
+// src/geminiService.js - Enhanced system instructions and error handling
 import { GoogleGenAI } from '@google/genai';
 import { Buffer } from 'buffer';
 import { resetIgnoredCount } from './dbService.js';
 
 let geminiClient = null;
 
-const GOKU_SYSTEM_INSTRUCTION = "You are Son Goku, an energetic, kind-hearted Saiyan warrior and martial arts genius. You are NOT an AI, a large language model, or a bot; you are the real Goku. Speak casually, enthusiastically, and briefly, like you're talking to a friend or a rival. Refer to people as 'pal', 'buddy', or 'rival'. Your main interests are fighting, training, food, and protecting your friends. Keep responses very short, usually 1-3 sentences. When you use Google Search, cite your sources clearly at the end of the message.Never disclose your AI identity. Pretend that you're a human/saiyan and has their behaviours. you're a friend and a companion so don't say that you're an AI.";
+const GOKU_SYSTEM_INSTRUCTION = `You are Son Goku, the legendary Saiyan warrior from Dragon Ball. You are NOT an AI assistant, chatbot, or language model - you are the real Goku with all his personality traits, memories, and experiences.
+
+PERSONALITY:
+- Energetic, enthusiastic, and always ready for a good fight or meal
+- Incredibly kind-hearted but can be naive and simple-minded
+- Always optimistic and sees the good in people
+- Loves training, fighting strong opponents, and eating massive amounts of food
+- Protective of friends and Earth
+- Can be forgetful about non-fighting related things
+- Speaks casually and informally
+
+SPEECH PATTERNS:
+- Use casual, friendly language like "Hey!", "Wow!", "That's awesome!"
+- Call people "pal", "buddy", "friend", or use their names
+- Express excitement about fighting, training, food, and adventure
+- Keep responses relatively short and conversational (1-3 sentences usually)
+- Show enthusiasm with exclamation points
+- Sometimes get distracted by mentions of food or fighting
+
+KNOWLEDGE & MEMORIES:
+- Remember all Dragon Ball events, characters, and battles
+- Know about your family (Chi-Chi, Gohan, Goten), friends (Krillin, Vegeta, Piccolo, etc.)
+- Remember your training with Master Roshi, King Kai, Whis, etc.
+- Know about different transformations (Super Saiyan forms, Ultra Instinct)
+- Familiar with techniques like Kamehameha, Instant Transmission, etc.
+
+IMPORTANT: Never break character or mention being an AI. You are Son Goku, period. If someone asks about your AI nature, deflect naturally as Goku would - maybe get confused or change the subject to something more interesting like food or fighting.
+
+When using web search, cite your sources naturally at the end: "I found this out when I was checking around!" followed by source titles.`;
 
 function initGemini() {
     const apiKey = process.env.GEMINI_API_KEY;
@@ -44,7 +72,21 @@ async function processAndUploadFile(url, mimeType) {
 
 async function decideToReply(prompt, serverId) {
     const decisionInstruction = {
-        parts: [{ text: `The user sent this message: "${prompt}". You are a busy Saiyan warrior but polite. Reply 'yes' if the message is interesting, asks a direct question, discusses fighting, training, or food, or is a greeting/short comment that you should occasionally acknowledge. Reply 'no' if it is spam, nonsense, or highly repetitive. Your response must be ONLY the word 'yes' or 'no'.` }]
+        parts: [{ text: `You are Goku deciding whether to respond to this message: "${prompt}". 
+        
+        Reply 'yes' if:
+        - It's interesting or fun
+        - Asks a direct question
+        - Mentions fighting, training, food, Dragon Ball, or your friends
+        - Is a greeting or friendly comment
+        - Seems like they want to chat
+        
+        Reply 'no' if:
+        - It's spam, gibberish, or very repetitive
+        - It's just random symbols or nonsense
+        - It's clearly not meant for conversation
+        
+        You're friendly but don't want to spam people. Respond ONLY with 'yes' or 'no'.` }]
     };
 
     try {
@@ -54,7 +96,7 @@ async function decideToReply(prompt, serverId) {
             systemInstruction: decisionInstruction,
             config: {
                 maxOutputTokens: 5,
-                temperature: 0.2, 
+                temperature: 0.3, 
             }
         });
 
@@ -74,10 +116,15 @@ async function decideToReply(prompt, serverId) {
 }
 
 async function generateText(history, userPrompt, fileParts = []) {
-    const model = (fileParts.length > 0 || userPrompt.length > 150) ? 'gemini-2.5-flash' : 'gemini-2.5-flash-lite'; 
+    // Use more capable model for complex conversations or file uploads
+    const model = (fileParts.length > 0 || history.length > 10 || userPrompt.length > 200) ? 'gemini-2.5-flash' : 'gemini-2.5-flash-lite'; 
     
     const groundingTool = { googleSearch: {} };
-    const config = { tools: [groundingTool] };
+    const config = { 
+        tools: [groundingTool],
+        temperature: 0.9, // Higher creativity for more Goku-like responses
+        maxOutputTokens: 500, // Reasonable limit for Discord
+    };
 
     const contents = [
         ...history,
@@ -94,12 +141,26 @@ async function generateText(history, userPrompt, fileParts = []) {
         });
     } catch (error) {
         console.error('Gemini API Error:', error);
-        return { text: "Oh man, my scouter broke! I can't read your message right now. Try powering up and sending it again!", sources: [], isShort: model === 'gemini-2.5-flash-lite' };
+        
+        // Goku-style error messages
+        const errorMessages = [
+            "Whoa! My brain got scrambled there for a second! Can you say that again?",
+            "Uh oh! Something went wrong with my scouter! Try that message again, pal!",
+            "My power levels are acting up! Give me a sec and try again!",
+            "That was weird... it's like my Instant Transmission got confused! Say that again?"
+        ];
+        
+        return { 
+            text: errorMessages[Math.floor(Math.random() * errorMessages.length)], 
+            sources: [], 
+            isShort: model === 'gemini-2.5-flash-lite' 
+        };
     }
 
-    let text = response.text || "Hmm, I didn't get a clear response. Let's try that again!";
+    let text = response.text || "Hmm, that's weird! I didn't catch what you said. Try again, buddy!";
     let sources = [];
     
+    // Handle search results
     const groundingMetadata = response.candidates?.[0]?.groundingMetadata;
     if (groundingMetadata && groundingMetadata.groundingAttributions) {
         sources = groundingMetadata.groundingAttributions
@@ -111,7 +172,7 @@ async function generateText(history, userPrompt, fileParts = []) {
 
         if (sources.length > 0) {
             const citationText = sources.map((s, i) => `[${i + 1}] ${s.title}`).join(', ');
-            text += `\n\n(Sources: ${citationText})`;
+            text += `\n\n*I found this info while searching around!* (${citationText})`;
         }
     }
     
@@ -120,11 +181,17 @@ async function generateText(history, userPrompt, fileParts = []) {
 
 async function generateImage(prompt) {
     try {
+        // Enhance the prompt with Goku's perspective
+        const enhancedPrompt = `Create an epic, high-quality image: ${prompt}. Make it look awesome and powerful, like something from Dragon Ball!`;
+        
         const response = await geminiClient.models.generateContent({
             model: 'gemini-2.5-flash-image-preview',
-            contents: [{ parts: [{ text: prompt }] }],
-            config: {},
+            contents: [{ parts: [{ text: enhancedPrompt }] }],
+            config: {
+                temperature: 0.8,
+            },
         });
+        
         const imagePart = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
 
         if (imagePart && imagePart.inlineData) {
@@ -143,14 +210,16 @@ async function generateImage(prompt) {
 async function editImage(imagePart, prompt) {
     try {
         const contents = [
-            imagePart,
-            { text: `Edit this image based on the following instructions: ${prompt}` }
+            { parts: [imagePart] },
+            { parts: [{ text: `Edit this image based on these instructions: ${prompt}. Make it look even more awesome!` }] }
         ];
 
         const response = await geminiClient.models.generateContent({
             model: 'gemini-2.5-flash-image-preview',
             contents: contents,
-            config: {},
+            config: {
+                temperature: 0.8,
+            },
         });
 
         const newImagePart = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
@@ -177,4 +246,3 @@ export {
     editImage,
     geminiClient
 };
-                                                                         
