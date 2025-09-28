@@ -3,7 +3,6 @@ import mongoose from 'mongoose';
 
 // --- MongoDB Schema for Conversation History ---
 const ConversationSchema = new mongoose.Schema({
-    // Discord message ID is crucial for editing messages
     messageId: { type: String, unique: true, sparse: true }, 
     serverId: { type: String, required: true },
     userId: { type: String, required: true },
@@ -18,19 +17,34 @@ const ConversationSchema = new mongoose.Schema({
 ConversationSchema.index({ serverId: 1, userId: 1, timestamp: -1 });
 const Conversation = mongoose.model('Conversation', ConversationSchema);
 
-// --- MongoDB Schema for Bot Active Status (Unchanged logic) ---
+// --- MongoDB Schema for Bot Active Status ---
 const BotStatusSchema = new mongoose.Schema({
     serverId: { type: String, required: true, unique: true },
     isActive: { type: Boolean, default: true }
 });
 const BotStatus = mongoose.model('BotStatus', BotStatusSchema);
 
-// --- MongoDB Schema for Ignored Messages Tracking ---
+// --- MongoDB Schema for Ignored Messages Tracking (Server-wide fallback) ---
 const IgnoredMessagesSchema = new mongoose.Schema({
     serverId: { type: String, required: true, unique: true },
-    count: { type: Number, default: 0 }, // Number of consecutive ignored messages
+    count: { type: Number, default: 0 }, 
 });
 const IgnoredMessages = mongoose.model('IgnoredMessages', IgnoredMessagesSchema);
+
+// --- MongoDB Schema for Continuous Reply Status (NEW) ---
+const ContinuousReplySchema = new mongoose.Schema({
+    userId: { type: String, required: true, unique: true },
+    isActive: { type: Boolean, default: false }
+});
+const ContinuousReply = mongoose.model('ContinuousReply', ContinuousReplySchema);
+
+// --- MongoDB Schema for Image Usage Limits (NEW) ---
+const ImageUsageSchema = new mongoose.Schema({
+    userId: { type: String, required: true, unique: true },
+    count: { type: Number, default: 0 },
+    lastReset: { type: Date, default: Date.now }
+});
+const ImageUsage = mongoose.model('ImageUsage', ImageUsageSchema);
 
 
 /**
@@ -76,7 +90,6 @@ async function saveMessage(serverId, userId, content, role, messageId = null, fi
 async function editMessage(messageId, newContent) {
     if (!mongoose.connection.readyState) return;
     try {
-        // Find the conversation entry by the stored Discord message ID and update content/timestamp
         await Conversation.updateOne({ messageId: messageId }, { $set: { content: newContent, timestamp: new Date() } });
         console.log(`Edited message ${messageId} in DB.`);
     } catch (error) {
@@ -92,7 +105,6 @@ async function getConversationHistory(serverId, userId, currentPrompt) {
 
     let history = [];
     try {
-        // Fetch 20 most recent messages + logic for retrieving one old relevant message (personal context)
         const recentMessages = await Conversation.find({
             $or: [
                 { userId: userId, serverId: serverId }, 
@@ -134,9 +146,33 @@ async function getConversationHistory(serverId, userId, currentPrompt) {
     return history;
 }
 
-// --- Ignored Messages Tracking Functions ---
-async function incrementIgnoredCount(serverId) {
+// Bot Status functions 
+async function setBotActiveStatus(serverId, isActive) {
     if (!mongoose.connection.readyState) return;
+    try {
+        await BotStatus.findOneAndUpdate(
+            { serverId: serverId },
+            { isActive: isActive },
+            { upsert: true, new: true }
+        );
+    } catch (error) {
+        console.error('Error setting bot status:', error);
+    }
+}
+
+async function getBotActiveStatus(serverId) {
+    if (!mongoose.connection.readyState) return true;
+    try {
+        const statusDoc = await BotStatus.findOne({ serverId: serverId });
+        return statusDoc ? statusDoc.isActive : true;
+    } catch (error) {
+        return true;
+    }
+}
+
+// Ignored Messages Tracking Functions
+async function incrementIgnoredCount(serverId) {
+    if (!mongoose.connection.readyState) return 0;
     try {
         const result = await IgnoredMessages.findOneAndUpdate(
             { serverId: serverId },
@@ -171,27 +207,65 @@ async function getIgnoredCount(serverId) {
     }
 }
 
-// Bot Status functions (unchanged)
-async function setBotActiveStatus(serverId, isActive) {
+// --- NEW Continuous Reply Functions ---
+async function setContinuousReplyStatus(userId, isActive) {
     if (!mongoose.connection.readyState) return;
     try {
-        await BotStatus.findOneAndUpdate(
-            { serverId: serverId },
+        await ContinuousReply.findOneAndUpdate(
+            { userId: userId },
             { isActive: isActive },
             { upsert: true, new: true }
         );
     } catch (error) {
-        console.error('Error setting bot status:', error);
+        console.error('Error setting continuous reply status:', error);
     }
 }
 
-async function getBotActiveStatus(serverId) {
-    if (!mongoose.connection.readyState) return true;
+async function getContinuousReplyStatus(userId) {
+    if (!mongoose.connection.readyState) return false;
     try {
-        const statusDoc = await BotStatus.findOne({ serverId: serverId });
-        return statusDoc ? statusDoc.isActive : true;
+        const statusDoc = await ContinuousReply.findOne({ userId: userId });
+        return statusDoc ? statusDoc.isActive : false;
     } catch (error) {
-        return true;
+        return false;
+    }
+}
+
+// --- NEW Image Usage Functions ---
+async function checkAndIncrementImageUsage(userId) {
+    if (!mongoose.connection.readyState) return { allowed: true, count: 0 };
+
+    const resetInterval = 24 * 60 * 60 * 1000; // 24 hours
+    const maxUsage = 5;
+    
+    try {
+        const usage = await ImageUsage.findOne({ userId: userId });
+        const now = new Date();
+
+        if (usage && (now - usage.lastReset) < resetInterval) {
+            if (usage.count >= maxUsage) {
+                return { allowed: false, count: usage.count };
+            }
+            // Increment count
+            const updatedUsage = await ImageUsage.findOneAndUpdate(
+                { userId: userId },
+                { $inc: { count: 1 } },
+                { new: true }
+            );
+            return { allowed: true, count: updatedUsage.count };
+        } else {
+            // Reset count and set lastReset to now, then increment
+            const updatedUsage = await ImageUsage.findOneAndUpdate(
+                { userId: userId },
+                { $set: { count: 1, lastReset: now } },
+                { upsert: true, new: true }
+            );
+            return { allowed: true, count: updatedUsage.count };
+        }
+    } catch (error) {
+        console.error('Error checking/incrementing image usage:', error);
+        // Default to allowing if there's a DB error
+        return { allowed: true, count: 0 }; 
     }
 }
 
@@ -199,11 +273,14 @@ async function getBotActiveStatus(serverId) {
 export {
     connectDB,
     saveMessage,
-    editMessage, // NEW
+    editMessage,
     getConversationHistory,
     setBotActiveStatus,
     getBotActiveStatus,
-    incrementIgnoredCount, // NEW
-    resetIgnoredCount,     // NEW
-    getIgnoredCount        // NEW
+    incrementIgnoredCount,
+    resetIgnoredCount,
+    getIgnoredCount,
+    setContinuousReplyStatus, 
+    getContinuousReplyStatus, 
+    checkAndIncrementImageUsage 
 };
