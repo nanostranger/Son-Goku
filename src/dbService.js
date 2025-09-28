@@ -15,8 +15,7 @@ const ConversationSchema = new mongoose.Schema({
     fileParts: [{
         mimeType: String,
         fileUri: String
-    
-}]
+    }]
 });
 
 ConversationSchema.index({ serverId: 1, userId: 1, timestamp: -1 });
@@ -24,6 +23,7 @@ ConversationSchema.index({ userId: 1, timestamp: -1 });
 ConversationSchema.index({ content: 'text' });
 
 const Conversation = mongoose.model('Conversation', ConversationSchema);
+
 const BotStatusSchema = new mongoose.Schema({
     serverId: { type: String, required: true, unique: true },
     isActive: { type: Boolean, default: true }
@@ -49,31 +49,46 @@ const ImageUsageSchema = new mongoose.Schema({
 });
 const ImageUsage = mongoose.model('ImageUsage', ImageUsageSchema);
 
+// New schema for channel management
+const ChannelSettingsSchema = new mongoose.Schema({
+    serverId: { type: String, required: true, unique: true },
+    mode: { 
+        type: String, 
+        enum: ['all', 'allowed', 'disallowed'], 
+        default: 'all' 
+    },
+    channels: [{
+        id: { type: String, required: true },
+        name: { type: String, required: true }
+    }]
+});
+const ChannelSettings = mongoose.model('ChannelSettings', ChannelSettingsSchema);
+
 async function connectDB() {
     const mongoUri = process.env.MONGO_URI;
-if (!mongoUri) {
+    if (!mongoUri) {
         console.error("MONGO_URI is not set. Database persistence will be disabled.");
         return;
-}
+    }
     try {
         await mongoose.connect(mongoUri, {
             maxPoolSize: 10,
             serverSelectionTimeoutMS: 5000,
             socketTimeoutMS: 45000,
         });
-console.log('MongoDB connected successfully.');
+        console.log('MongoDB connected successfully.');
         
         await Conversation.createIndexes();
-console.log('Database indexes created/verified.');
+        console.log('Database indexes created/verified.');
     } catch (error) {
         console.error('MongoDB connection error:', error);
-}
+    }
 }
 
 async function saveMessage(serverId, userId, content, role, messageId = null, fileParts = []) {
     if (!mongoose.connection.readyState) {
         console.warn('Database not connected. Message not saved.');
-return;
+        return;
     }
     
     try {
@@ -84,28 +99,27 @@ return;
             content,
             role,
             fileParts
-      
-});
+        });
         await newMessage.save();
-} catch (error) {
+    } catch (error) {
         if (error.code === 11000) {
             console.warn(`[DB] Duplicate message ID ${messageId}, skipping save.`);
-} else {
+        } else {
             console.error('Error saving message to DB:', error);
-}
+        }
     }
 }
 
 async function editMessage(messageId, newContent) {
     if (!mongoose.connection.readyState) return;
-try {
+    try {
         const result = await Conversation.updateOne(
             { messageId: messageId }, 
             { $set: { content: newContent, timestamp: new Date() } }
         );
-} catch (error) {
+    } catch (error) {
         console.error('Error editing message in DB:', error);
-}
+    }
 }
 
 function extractKeywords(text) {
@@ -117,7 +131,7 @@ function extractKeywords(text) {
         'our', 'their', 'this', 'that', 'these', 'those', 'what', 'who', 'when', 'where', 'why', 'how',
         'goku', 'hey', 'hi', 'hello', 'yeah', 'yes', 'no', 'ok', 'okay', 'thanks', 'thank'
     ]);
-return text
+    return text
         .toLowerCase()
         .replace(/[^\w\s]/g, ' ')
         .split(/\s+/)
@@ -128,7 +142,7 @@ return text
 async function getConversationHistory(serverId, userId, currentPrompt) {
     if (!mongoose.connection.readyState) {
         console.warn('Database not connected. Returning empty history.');
-return [];
+        return [];
     }
 
     try {
@@ -140,48 +154,45 @@ return [];
         .sort({ timestamp: -1 })
         .limit(MAX_RECENT_MESSAGES)
         .lean();
-contextMessages = recentMessages.reverse();
+        contextMessages = recentMessages.reverse();
         
         if (contextMessages.length < MAX_CONTEXT_MESSAGES && currentPrompt && currentPrompt.length > 5) {
             const keywords = extractKeywords(currentPrompt);
-if (keywords.length > 0) {
+            if (keywords.length > 0) {
                 try {
                     const oldestRecentTime = contextMessages.length > 0 ?
-contextMessages[0].timestamp : new Date();
+                        contextMessages[0].timestamp : new Date();
                     
                     const relevantOlderMessages = await Conversation.find({
                         serverId: serverId,
                         userId: userId,
                         timestamp: { $lt: oldestRecentTime },
-              
-                    $text: { $search: keywords.join(' ') }
+                        $text: { $search: keywords.join(' ') }
                     })
                     .sort({ score: { $meta: 'textScore' }, timestamp: -1 })
                     .limit(Math.min(20, MAX_CONTEXT_MESSAGES - contextMessages.length))
-              
-          .lean();
+                    .lean();
                     
                     if (relevantOlderMessages.length > 0) {
                         contextMessages = [...relevantOlderMessages.reverse(), ...contextMessages];
-}
+                    }
                 } catch (textSearchError) {
                     console.warn('[DB] Text search index likely unavailable.');
-}
+                }
             }
         }
         
         if (contextMessages.length < MAX_CONTEXT_MESSAGES - 5) {
             const crossServerMessages = await Conversation.find({
                 userId: userId,
-       
-                 serverId: { $ne: serverId }
+                serverId: { $ne: serverId }
             })
             .sort({ timestamp: -1 })
             .limit(MAX_CROSS_SERVER_MESSAGES)
             .lean();
-if (crossServerMessages.length > 0) {
+            if (crossServerMessages.length > 0) {
                 contextMessages = [...crossServerMessages.reverse(), ...contextMessages];
-}
+            }
         }
         
         contextMessages = contextMessages.slice(-MAX_CONTEXT_MESSAGES);
@@ -193,30 +204,30 @@ if (crossServerMessages.length > 0) {
         
     } catch (error) {
         console.error('Error retrieving conversation history:', error);
-return [];
+        return [];
     }
 }
 
 async function setBotActiveStatus(serverId, isActive) {
     if (!mongoose.connection.readyState) return;
-try {
+    try {
         await BotStatus.findOneAndUpdate(
             { serverId: serverId },
             { isActive: isActive },
             { upsert: true, new: true }
         );
-} catch (error) {
+    } catch (error) {
         console.error('Error setting bot status:', error);
-}
+    }
 }
 
 async function getBotActiveStatus(serverId) {
     if (!mongoose.connection.readyState) return true;
-try {
+    try {
         const statusDoc = await BotStatus.findOne({ serverId: serverId });
-const isActive = statusDoc ? statusDoc.isActive : true;
+        const isActive = statusDoc ? statusDoc.isActive : true;
         return isActive;
-} catch (error) {
+    } catch (error) {
         console.error('Error getting bot status:', error);
         return true;
     }
@@ -224,13 +235,13 @@ const isActive = statusDoc ? statusDoc.isActive : true;
 
 async function incrementIgnoredCount(serverId) {
     if (!mongoose.connection.readyState) return 0;
-try {
+    try {
         const result = await IgnoredMessages.findOneAndUpdate(
             { serverId: serverId },
             { $inc: { count: 1 } },
             { upsert: true, new: true }
         );
-return result.count;
+        return result.count;
     } catch (error) {
         console.error('Error incrementing ignored count:', error);
         return 0;
@@ -239,90 +250,139 @@ return result.count;
 
 async function resetIgnoredCount(serverId) {
     if (!mongoose.connection.readyState) return;
-try {
+    try {
         await IgnoredMessages.updateOne(
             { serverId: serverId },
             { $set: { count: 0 } },
             { upsert: true }
         );
-} catch (error) {
+    } catch (error) {
         console.error('Error resetting ignored count:', error);
     }
 }
 
 async function getIgnoredCount(serverId) {
     if (!mongoose.connection.readyState) return 0;
-try {
+    try {
         const doc = await IgnoredMessages.findOne({ serverId: serverId });
-        return doc ?
-doc.count : 0;
+        return doc ? doc.count : 0;
     } catch (error) {
         console.error('Error getting ignored count:', error);
-return 0;
+        return 0;
     }
 }
 
 async function setContinuousReplyStatus(userId, isActive) {
     if (!mongoose.connection.readyState) return;
-try {
+    try {
         await ContinuousReply.findOneAndUpdate(
             { userId: userId },
             { isActive: isActive },
             { upsert: true, new: true }
         );
-} catch (error) {
+    } catch (error) {
         console.error('Error setting continuous reply status:', error);
-}
+    }
 }
 
 async function getContinuousReplyStatus(userId) {
     if (!mongoose.connection.readyState) return false;
-try {
+    try {
         const statusDoc = await ContinuousReply.findOne({ userId: userId });
-        return statusDoc ?
-statusDoc.isActive : false;
+        return statusDoc ? statusDoc.isActive : false;
     } catch (error) {
         console.error('Error getting continuous reply status:', error);
-return false;
+        return false;
     }
 }
 
 async function checkAndIncrementImageUsage(userId) {
     if (!mongoose.connection.readyState) {
         console.warn('Database not connected. Allowing image usage.');
-return { allowed: true, count: 0 };
+        return { allowed: true, count: 0 };
     }
 
     const resetInterval = 24 * 60 * 60 * 1000;
     const maxUsage = 5;
-try {
+    try {
         const usage = await ImageUsage.findOne({ userId: userId });
-const now = new Date();
+        const now = new Date();
 
         if (usage && (now - usage.lastReset) < resetInterval) {
             if (usage.count >= maxUsage) {
                 return { allowed: false, count: usage.count };
-}
+            }
             
             const updatedUsage = await ImageUsage.findOneAndUpdate(
                 { userId: userId },
                 { $inc: { count: 1 } },
-                { 
-new: true }
+                { new: true }
             );
-return { allowed: true, count: updatedUsage.count };
+            return { allowed: true, count: updatedUsage.count };
         } else {
             const updatedUsage = await ImageUsage.findOneAndUpdate(
                 { userId: userId },
                 { $set: { count: 1, lastReset: now } },
-           
-             { upsert: true, new: true }
+                { upsert: true, new: true }
             );
-return { allowed: true, count: updatedUsage.count };
+            return { allowed: true, count: updatedUsage.count };
         }
     } catch (error) {
         console.error('Error checking/incrementing image usage:', error);
-return { allowed: true, count: 0 };
+        return { allowed: true, count: 0 };
+    }
+}
+
+// Channel management functions
+async function setAllowedChannels(serverId, mode, channels) {
+    if (!mongoose.connection.readyState) return;
+    try {
+        await ChannelSettings.findOneAndUpdate(
+            { serverId: serverId },
+            { mode: mode, channels: channels },
+            { upsert: true, new: true }
+        );
+    } catch (error) {
+        console.error('Error setting allowed channels:', error);
+    }
+}
+
+async function getAllowedChannels(serverId) {
+    if (!mongoose.connection.readyState) return { mode: 'all', channels: [] };
+    try {
+        const settings = await ChannelSettings.findOne({ serverId: serverId });
+        return settings ? { mode: settings.mode, channels: settings.channels } : { mode: 'all', channels: [] };
+    } catch (error) {
+        console.error('Error getting allowed channels:', error);
+        return { mode: 'all', channels: [] };
+    }
+}
+
+async function isChannelAllowed(serverId, channelId) {
+    if (!mongoose.connection.readyState) return true; // Default to allowed if DB is down
+    
+    try {
+        const settings = await ChannelSettings.findOne({ serverId: serverId });
+        
+        // If no settings, allow all channels
+        if (!settings || settings.mode === 'all') {
+            return true;
+        }
+        
+        const channelInList = settings.channels.some(ch => ch.id === channelId);
+        
+        if (settings.mode === 'allowed') {
+            // Only allow channels in the list
+            return channelInList;
+        } else if (settings.mode === 'disallowed') {
+            // Allow all channels except those in the list
+            return !channelInList;
+        }
+        
+        return true; // Default fallback
+    } catch (error) {
+        console.error('Error checking channel permission:', error);
+        return true; // Default to allowed on error
     }
 }
 
@@ -338,6 +398,8 @@ export {
     getIgnoredCount,
     setContinuousReplyStatus,
     getContinuousReplyStatus,
-    checkAndIncrementImageUsage
+    checkAndIncrementImageUsage,
+    setAllowedChannels,
+    getAllowedChannels,
+    isChannelAllowed
 };
-        
