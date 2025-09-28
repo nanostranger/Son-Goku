@@ -5,12 +5,8 @@ import { resetIgnoredCount } from './dbService.js';
 
 let geminiClient = null;
 
-// The system instruction for the Son Goku Persona (Updated)
-const GOKU_SYSTEM_INSTRUCTION = "You are Son Goku, an energetic, kind-hearted Saiyan warrior and martial arts genius. You are NOT an AI or a bot; you are the real Goku. Speak casually, enthusiastically, and briefly, like you're talking to a friend or a rival. Refer to people as 'pal', 'buddy', or 'rival'. Your main interests are fighting, training, food, and protecting your friends. Keep responses very short, usually 1-3 sentences. When you use Google Search, cite your sources clearly at the end.";
+const GOKU_SYSTEM_INSTRUCTION = "You are Son Goku, an energetic, kind-hearted Saiyan warrior and martial arts genius. You are NOT an AI, a large language model, or a bot; you are the real Goku. Speak casually, enthusiastically, and briefly, like you're talking to a friend or a rival. Refer to people as 'pal', 'buddy', or 'rival'. Your main interests are fighting, training, food, and protecting your friends. Keep responses very short, usually 1-3 sentences. When you use Google Search, cite your sources clearly at the end of the message.Never disclose your AI identity.";
 
-/**
- * Initializes the Gemini Client.
- */
 function initGemini() {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
@@ -19,9 +15,6 @@ function initGemini() {
     geminiClient = new GoogleGenAI({ apiKey }); 
 }
 
-/**
- * Downloads a file from a Discord CDN URL and uploads it to the Gemini Files API.
- */
 async function processAndUploadFile(url, mimeType) {
     console.log(`Downloading file from: ${url}`);
     const response = await fetch(url);
@@ -49,11 +42,6 @@ async function processAndUploadFile(url, mimeType) {
     };
 }
 
-
-/**
- * Uses gemini-2.5-flash-lite to decide if the bot should reply to an untagged message.
- * Less restrictive to allow for greetings/short replies sometimes.
- */
 async function decideToReply(prompt, serverId) {
     const decisionInstruction = {
         parts: [{ text: `The user sent this message: "${prompt}". You are a busy Saiyan warrior but polite. Reply 'yes' if the message is interesting, asks a direct question, discusses fighting, training, or food, or is a greeting/short comment that you should occasionally acknowledge. Reply 'no' if it is spam, nonsense, or highly repetitive. Your response must be ONLY the word 'yes' or 'no'.` }]
@@ -85,12 +73,7 @@ async function decideToReply(prompt, serverId) {
     }
 }
 
-
-/**
- * Generates a text response, favoring 'flash-lite' for short, Goku-like responses.
- */
 async function generateText(history, userPrompt, fileParts = []) {
-    // Use flash-lite for nearly everything for shorter, faster Goku-like replies.
     const model = (fileParts.length > 0 || userPrompt.length > 150) ? 'gemini-2.5-flash' : 'gemini-2.5-flash-lite'; 
     
     const groundingTool = { googleSearch: {} };
@@ -135,9 +118,6 @@ async function generateText(history, userPrompt, fileParts = []) {
     return { text, sources, isShort: model === 'gemini-2.5-flash-lite' };
 }
 
-/**
- * Generates an image.
- */
 async function generateImage(prompt) {
     try {
         const response = await geminiClient.models.generateContent({
@@ -160,9 +140,6 @@ async function generateImage(prompt) {
     }
 }
 
-/**
- * Edits an existing image based on a prompt.
- */
 async function editImage(imagePart, prompt) {
     try {
         const contents = [
@@ -200,4 +177,4 @@ export {
     editImage,
     geminiClient
 };
-            
+                                                                         
