@@ -2,18 +2,19 @@
 import { 
     Client, GatewayIntentBits, Partials, SlashCommandBuilder, Routes, 
     AttachmentBuilder, PermissionsBitField, ActivityType, 
-    Guild 
+    Collection 
 } from 'discord.js';
 import { REST } from '@discordjs/rest';
 import express from 'express';
 import { 
     initGemini, processAndUploadFile, generateText, generateImage, 
-    geminiClient, decideToReply 
+    editImage, decideToReply 
 } from './src/geminiService.js';
 import { 
     connectDB, saveMessage, getConversationHistory, setBotActiveStatus, 
     getBotActiveStatus, editMessage, incrementIgnoredCount, resetIgnoredCount, 
-    getIgnoredCount 
+    getIgnoredCount, setContinuousReplyStatus, getContinuousReplyStatus, 
+    checkAndIncrementImageUsage 
 } from './src/dbService.js';
 import { log } from 'console';
 
@@ -21,7 +22,7 @@ import { log } from 'console';
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const PORT = process.env.PORT || 3000;
-const MAX_IGNORE_COUNT = 3; // Reply after 3 ignored messages
+const MAX_IGNORE_COUNT = 1; // Reply must happen after 1 ignore
 
 // Discord Client Setup
 const client = new Client({
@@ -35,8 +36,10 @@ const client = new Client({
     partials: [Partials.Channel, Partials.Message],
 });
 
-// Cache to prevent race conditions and manage channel locks during replies
+// Cache to prevent race conditions on replies
 const isBotResponding = new Map(); 
+// Cache to track ongoing /draw interactions
+const activeDrawInteractions = new Collection(); 
 
 // Initialize services
 connectDB();
@@ -64,7 +67,6 @@ function splitLongResponse(text) {
         messages.push(text);
         return messages;
     }
-    // ... (Splitting logic remains the same for robustness)
     let currentText = text;
     while (currentText.length > 0) {
         let chunk = currentText.substring(0, MAX_LENGTH);
@@ -92,24 +94,23 @@ function splitLongResponse(text) {
 }
 
 /**
- * Calculates the typing duration based on response length for realism (New Logic).
+ * Calculates the typing duration (UPDATED LOGIC).
  */
 function calculateTypingDelay(responseText) {
     const length = responseText.length;
-    if (length < 100) return 2000; // 2 seconds for simple replies
-    if (length < 500) return 4000; // 4 seconds for longer context
-    if (length < 1000) return 5000; // 5 seconds for medium length
-    return 8000; // 8 seconds for very long
+    // 1-2 sentences (approx < 100 chars) -> 2 seconds
+    if (length < 100) return 2000; 
+    // Longer replies -> 5 seconds max
+    return 5000; 
 }
 
 /**
- * Ensures the 'KAKAROT' role exists and is created if missing (New Logic).
+ * Ensures the 'KAKAROT' role exists and is created if missing.
  */
 async function ensureKakarotRole(guild) {
     const ROLE_NAME = 'KAKAROT';
     const ROLE_COLOR = 'YELLOW';
     
-    // Check if the role already exists
     let kakarotRole = guild.roles.cache.find(role => role.name === ROLE_NAME);
     
     if (!kakarotRole) {
@@ -127,52 +128,122 @@ async function ensureKakarotRole(guild) {
     }
 }
 
-// --- Slash Command Definitions (Updated descriptions/replies) ---
+// --- Activity List (50+ Random Activities) ---
+const GOKU_ACTIVITIES = [
+    { name: 'Kame Hame Ha!', type: ActivityType.Playing },
+    { name: 'Training with Vegeta', type: ActivityType.Playing },
+    { name: 'Searching for Dragon Balls', type: ActivityType.Watching },
+    { name: 'Eating a Senzu Bean', type: ActivityType.Custom },
+    { name: 'Instant Transmission practice', type: ActivityType.Playing },
+    { name: 'Waiting for the next tournament', type: ActivityType.Watching },
+    { name: 'Powering up to Super Saiyan', type: ActivityType.Playing },
+    { name: 'Trying to catch Bubbles', type: ActivityType.Playing },
+    { name: 'Learning the Kaioken', type: ActivityType.Playing },
+    { name: 'Fighting Frieza', type: ActivityType.Playing },
+    { name: 'Eating 50 bowls of rice', type: ActivityType.Custom },
+    { name: 'Charging a Spirit Bomb', type: ActivityType.Playing },
+    { name: 'Chasing after Krillin', type: ActivityType.Watching },
+    { name: 'Visiting King Kai', type: ActivityType.Listening },
+    { name: 'Napping with Gohan', type: ActivityType.Playing },
+    { name: 'Looking for a giant meal', type: ActivityType.Watching },
+    { name: 'Meditating on Namek', type: ActivityType.Listening },
+    { name: 'Sparring with Piccolo', type: ActivityType.Playing },
+    { name: 'Defending Earth', type: ActivityType.Playing },
+    { name: 'Mastering Ultra Instinct', type: ActivityType.Playing },
+    { name: 'Looking for Chi-Chi', type: ActivityType.Watching },
+    { name: 'Driving a car (badly)', type: ActivityType.Playing },
+    { name: 'Doing push-ups in 100x gravity', type: ActivityType.Playing },
+    { name: 'Eating a giant fish', type: ActivityType.Custom },
+    { name: 'Fighting Beerus', type: ActivityType.Playing },
+    { name: 'Counting his strength', type: ActivityType.Watching },
+    { name: 'Testing his limits', type: ActivityType.Playing },
+    { name: 'Looking for a new rival', type: ActivityType.Watching },
+    { name: 'Listening to Bulma complain', type: ActivityType.Listening },
+    { name: 'Trying to understand girls', type: ActivityType.Custom },
+    { name: 'Practicing the Destructo Disk', type: ActivityType.Playing },
+    { name: 'Watching Hercule lose', type: ActivityType.Watching },
+    { name: 'Talking to Shenron', type: ActivityType.Watching },
+    { name: 'Making new friends', type: ActivityType.Playing },
+    { name: 'Getting yelled at by Chi-Chi', type: ActivityType.Listening },
+    { name: 'Training Goten', type: ActivityType.Playing },
+    { name: 'Visiting Kami’s Lookout', type: ActivityType.Listening },
+    { name: 'Challenging Whis', type: ActivityType.Playing },
+    { name: 'Powering down for a snack', type: ActivityType.Custom },
+    { name: 'Waiting for Vegeta to cool off', type: ActivityType.Watching },
+    { name: 'Practicing Fusion Dance', type: ActivityType.Playing },
+    { name: 'Eating all the food in the fridge', type: ActivityType.Custom },
+    { name: 'Punching mountains', type: ActivityType.Playing },
+    { name: 'Traveling to other planets', type: ActivityType.Watching },
+    { name: 'Looking for a worthy opponent', type: ActivityType.Watching },
+    { name: 'Doing warm-ups', type: ActivityType.Playing },
+    { name: 'Getting a new Gi', type: ActivityType.Custom },
+    { name: 'Flying around the world', type: ActivityType.Playing },
+    { name: 'Talking about fighting', type: ActivityType.Listening },
+    { name: 'Fighting Cell', type: ActivityType.Playing },
+];
+
+
+// --- Slash Command Definitions ---
 const commands = [
     new SlashCommandBuilder()
         .setName('start')
         .setDescription('Ready to fight! Makes Goku active to chat with everyone.')
-        .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild), 
+        .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild)
+        .toJSON(),
     new SlashCommandBuilder()
         .setName('stop')
         .setDescription('I\'m tired now, I go to sleep. Makes Goku quiet and inactive.')
-        .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild), 
+        .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild)
+        .toJSON(),
     new SlashCommandBuilder()
         .setName('imagine')
-        .setDescription('Power up and create an epic image! (Uses AI to generate a picture)')
+        .setDescription('Power up and create an epic image! (5 uses/day)')
         .addStringOption(option =>
             option.setName('prompt')
                 .setDescription('What kind of epic scene do you want to imagine?')
-                .setRequired(true)),
-].map(command => command.toJSON());
+                .setRequired(true))
+        .toJSON(),
+    new SlashCommandBuilder() 
+        .setName('draw')
+        .setDescription('Wanna make changes to an image? Give me a picture and tell me what to do! (5 uses/day)')
+        .toJSON(),
+    new SlashCommandBuilder() 
+        .setName('reply')
+        .setDescription('Tell Goku to continuously chat or take a break from untagged messages.')
+        .addStringOption(option =>
+            option.setName('mode')
+                .setDescription('Should Goku continuously reply to you or only when mentioned?')
+                .setRequired(true)
+                .addChoices(
+                    { name: 'on (Chat continuously)', value: 'on' },
+                    { name: 'off (Only reply when mentioned)', value: 'off' }
+                ))
+        .toJSON(),
+];
 
 // --- Register Slash Commands & Bot Activity ---
 client.on('ready', async () => {
     console.log(`Logged in as ${client.user.tag}!`);
 
-    // Set Bot Activity: Cycle between status messages (New Logic)
-    const activities = [
-        { name: 'Kame Hame Ha!', type: ActivityType.Playing },
-        { name: 'Training with Vegeta', type: ActivityType.Playing },
-        { name: 'Searching for Dragon Balls', type: ActivityType.Watching },
-        { name: 'Eating a Senzu Bean', type: ActivityType.Custom },
-    ];
-    let activityIndex = 0;
-    
-    setInterval(() => {
-        const activity = activities[activityIndex];
+    // Set Bot Activity: Cycle between status messages HOURLY (Updated Logic)
+    function setRandomActivity() {
+        const activity = GOKU_ACTIVITIES[Math.floor(Math.random() * GOKU_ACTIVITIES.length)];
         client.user.setActivity(activity.name, { type: activity.type });
-        activityIndex = (activityIndex + 1) % activities.length;
-    }, 15000); // Change activity every 15 seconds
+    }
+    
+    // Set initial activity
+    setRandomActivity();
+    // Change activity every hour (3600000 ms)
+    setInterval(setRandomActivity, 3600000); 
 
-    // Hourly check for KAKAROT role across all guilds (New Logic)
+    // Hourly check for KAKAROT role across all guilds (unchanged)
     setInterval(() => {
         for (const guild of client.guilds.cache.values()) {
             ensureKakarotRole(guild).catch(console.error);
         }
-    }, 3600000); // 1 hour
+    }, 3600000); 
 
-    // Deploy Commands
+    // Deploy Commands (unchanged)
     const rest = new REST({ version: '10' }).setToken(DISCORD_BOT_TOKEN);
     try {
         await rest.put(
@@ -185,7 +256,7 @@ client.on('ready', async () => {
     }
 });
 
-// --- Welcome Message & Role Check on Guild Join (New Logic) ---
+// --- Welcome Message & Role Check on Guild Join (unchanged) ---
 client.on('guildCreate', async guild => {
     console.log(`Joined a new guild: ${guild.name} (ID: ${guild.id})`);
 
@@ -201,13 +272,18 @@ client.on('guildCreate', async guild => {
     }
 });
 
-// --- Command Handling (Updated replies) ---
+// --- Command Handling ---
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
-    const { commandName } = interaction;
+    const { commandName, user, channelId, channel } = interaction;
     const serverId = interaction.guildId || 'DM'; 
 
+    if (activeDrawInteractions.has(user.id) && commandName !== 'draw') {
+        await interaction.reply({ content: "Whoa, hold on! You're already powering up a `/draw` command! Finish that one before starting a new one, pal!", ephemeral: true });
+        return;
+    }
+    
     await interaction.deferReply(); 
 
     switch (commandName) {
@@ -219,26 +295,134 @@ client.on('interactionCreate', async interaction => {
         case 'stop':
             await setBotActiveStatus(serverId, false);
             await interaction.editReply(`Whew, that was a good run! I'm gonna take a nap and won't respond until a moderator wakes me up. See ya later!`);
-            // Reset ignored messages when manually stopped
             await resetIgnoredCount(serverId);
             break;
             
         case 'imagine':
-            const prompt = interaction.options.getString('prompt');
-            await interaction.editReply(`Okay, stand back! I'm channeling my energy to generate a super-awesome image for **"${prompt}"**! Don't blink!`);
+        case 'draw': 
+            // 1. Check Image Usage Limit (NEW)
+            const usageResult = await checkAndIncrementImageUsage(user.id);
+            if (!usageResult.allowed) {
+                return interaction.editReply(`My energy for drawing is all used up for today! I can only do 5 image creations per day, pal. I've already done **${usageResult.count}**! Come back tomorrow!`);
+            }
 
-            const imageUrl = await generateImage(prompt);
+            if (commandName === 'imagine') {
+                const prompt = interaction.options.getString('prompt');
+                await interaction.editReply(`Okay, stand back! I'm channeling my energy to generate a super-awesome image for **"${prompt}"**! Don't blink!`);
 
-            if (imageUrl) {
-                const base64Data = imageUrl.split(',')[1];
-                const buffer = Buffer.from(base64Data, 'base64');
-                const attachment = new AttachmentBuilder(buffer, { name: 'goku_image.png' });
-                await interaction.editReply({
-                    content: `Here is the image for: **"${prompt}"**! Looks epic, huh?!`,
-                    files: [attachment]
-                });
+                const imageUrl = await generateImage(prompt);
+                
+                if (imageUrl) {
+                    const base64Data = imageUrl.split(',')[1];
+                    const buffer = Buffer.from(base64Data, 'base64');
+                    const attachment = new AttachmentBuilder(buffer, { name: 'goku_image.png' });
+                    await interaction.editReply({
+                        content: `Here is the image for: **"${prompt}"**! Looks epic, huh?! You have **${5 - usageResult.count}** uses left today!`,
+                        files: [attachment]
+                    });
+                } else {
+                    await interaction.editReply('Oops, I couldn\'t generate that image right now. My energy ran out! Try a simpler prompt, pal!');
+                }
+            } else { // 'draw' command logic
+                // ... (Draw logic is largely the same, but with usage checks added)
+                const initialReply = await interaction.editReply(`Alright, I can power up your image! **Reply to this message with the picture you want to change within 30 seconds!**`);
+                activeDrawInteractions.set(user.id, { step: 'image' });
+
+                try {
+                    const imageCollector = channel.createMessageCollector({
+                        filter: m => m.author.id === user.id && m.attachments.size > 0 && activeDrawInteractions.get(user.id)?.step === 'image',
+                        time: 30000, max: 1
+                    });
+
+                    const collectedImage = await new Promise((resolve, reject) => {
+                        imageCollector.on('collect', m => resolve(m));
+                        imageCollector.on('end', collected => {
+                            if (collected.size === 0) reject(new Error('timeout_image'));
+                        });
+                    });
+
+                    if (!collectedImage) throw new Error('no_image');
+
+                    const attachment = collectedImage.attachments.first();
+                    if (!attachment.contentType || !attachment.contentType.startsWith('image')) {
+                        throw new Error('not_image');
+                    }
+
+                    const { file: geminiFile, filePart: imagePart } = await processAndUploadFile(attachment.url, attachment.contentType);
+                    
+                    await initialReply.edit(`Awesome! Now tell me, **what changes should I make to this picture?** (You have 30 seconds)`);
+                    activeDrawInteractions.set(user.id, { step: 'prompt', file: geminiFile, imagePart: imagePart });
+
+                    const promptCollector = channel.createMessageCollector({
+                        filter: m => m.author.id === user.id && m.content && activeDrawInteractions.get(user.id)?.step === 'prompt',
+                        time: 30000, max: 1
+                    });
+                    
+                    const collectedPrompt = await new Promise((resolve, reject) => {
+                        promptCollector.on('collect', m => resolve(m));
+                        promptCollector.on('end', collected => {
+                            if (collected.size === 0) reject(new Error('timeout_prompt'));
+                        });
+                    });
+
+                    if (!collectedPrompt) throw new Error('no_prompt');
+
+                    const promptText = collectedPrompt.content;
+
+                    await initialReply.edit(`Powering up... **Drawing the changes for you!** Hold tight!`);
+
+                    const editedImageUrl = await editImage(imagePart, promptText);
+
+                    if (editedImageUrl) {
+                        const base64Data = editedImageUrl.split(',')[1];
+                        const buffer = Buffer.from(base64Data, 'base64');
+                        const imageAttachment = new AttachmentBuilder(buffer, { name: 'goku_edited_image.png' });
+                        
+                        await initialReply.edit({
+                            content: `**TADA!** Here’s the updated picture based on your command: **"${promptText}"**! Did I get stronger?! You have **${5 - usageResult.count}** uses left today!`,
+                            files: [imageAttachment]
+                        });
+                    } else {
+                        await initialReply.edit('Uh oh, I couldn\'t figure out how to draw that change! My power levels dropped. Try a simpler change, pal!');
+                    }
+
+                } catch (error) {
+                    let errorMessage;
+                    if (error.message === 'timeout_image') {
+                        errorMessage = "Time's up! You didn't give me an image fast enough. Next time, move quicker, buddy!";
+                    } else if (error.message === 'timeout_prompt') {
+                        errorMessage = "Time's up! I need the change prompt right away! Let's try again with `/draw`.";
+                    } else if (error.message === 'not_image') {
+                        errorMessage = "That wasn't a picture! Try again with an actual image file.";
+                    } else {
+                        console.error('Fatal /draw flow error:', error);
+                        errorMessage = "Oh no, something went wrong with the process! Let's start over with `/draw`.";
+                    }
+                    await initialReply.edit(errorMessage).catch(e => console.error("Error editing final /draw reply:", e.message));
+
+                } finally {
+                    activeDrawInteractions.delete(user.id);
+                    const interactionData = activeDrawInteractions.get(user.id);
+                    if (interactionData && interactionData.file) {
+                        try {
+                            await client.files.delete({ name: interactionData.file.name }); 
+                        } catch (e) {
+                            console.warn('Failed to clean up Gemini file after /draw:', e.message);
+                        }
+                    }
+                }
+            }
+            break;
+            
+        case 'reply': // NEW /reply COMMAND LOGIC
+            const mode = interaction.options.getString('mode');
+            const isActive = mode === 'on';
+            await setContinuousReplyStatus(user.id, isActive);
+            
+            if (isActive) {
+                await interaction.editReply(`YAY! Continuous chat **ON**! I'll talk to you a lot more now, buddy! Let's keep the conversation going!`);
             } else {
-                await interaction.editReply('Oops, I couldn\'t generate that image right now. My energy ran out! Try a simpler prompt, pal!');
+                await interaction.editReply(`Okay, continuous chat **OFF**. I'll only reply when you **@mention** me now. I need to save my energy for snacks!`);
             }
             break;
     }
@@ -246,150 +430,6 @@ client.on('interactionCreate', async interaction => {
 
 // --- Message Edit Handler (Updates DB) ---
 client.on('messageUpdate', async (oldMessage, newMessage) => {
-    // Only process user messages with content changes
     if (newMessage.author.bot || oldMessage.content === newMessage.content) return;
-
-    // Use the messageId to update the content in the database
     await editMessage(newMessage.id, newMessage.content);
-    console.log(`[DB] Updated edited message ${newMessage.id}.`);
-});
-
-// --- Message Handling (Main Chat Logic) ---
-client.on('messageCreate', async message => {
-    if (message.author.bot || !message.inGuild() && !message.channel.isDMBased()) return;
-
-    const serverId = message.guildId || 'DM';
-    const userId = message.author.id;
-    const isTagged = message.content.startsWith(`<@${client.user.id}>`);
-    const rawPrompt = isTagged ? message.content.replace(`<@${client.user.id}>`, '').trim() : message.content.trim();
-
-    // 1. Check Bot Activity (Stop/Start command status)
-    const isBotActive = await getBotActiveStatus(serverId);
-    if (!isBotActive) return;
-
-    // 2. Check for empty prompt after mention
-    if (isTagged && !rawPrompt) {
-        message.reply("You called my name, but didn't say anything! What's up, buddy?");
-        return;
-    }
-    
-    // 3. Untagged Message Decision Logic (New Logic)
-    let shouldReply = isTagged;
-    let ignoreCount = 0;
-
-    if (!isTagged) {
-        ignoreCount = await getIgnoredCount(serverId);
-        
-        if (ignoreCount >= MAX_IGNORE_COUNT) {
-            shouldReply = true;
-        } else {
-            shouldReply = await decideToReply(rawPrompt, serverId);
-        }
-    }
-
-    if (!shouldReply) {
-        // Only increment if we decided not to reply via Gemini-Lite AND didn't hit the max limit
-        if (!isTagged && ignoreCount < MAX_IGNORE_COUNT) {
-            await incrementIgnoredCount(serverId);
-        }
-        return; 
-    }
-
-    // If we're here, we need to reply. Reset count for all replies.
-    await resetIgnoredCount(serverId);
-    
-    // 4. Concurrency Check (Lock the channel to prevent overlapping replies)
-    const channelId = message.channel.id;
-    if (isBotResponding.get(channelId)) {
-        if (isTagged) {
-            message.reply("Hold on a sec, pal! I'm finishing up a thought! I'll be right with ya!");
-        }
-        return;
-    }
-    isBotResponding.set(channelId, true); // Lock the channel
-
-    // --- Main Reply Flow ---
-    let filesToCleanup = [];
-    
-    try {
-        // a. Multimodal File Handling
-        const attachments = Array.from(message.attachments.values());
-        let fileParts = [];
-        for (const attachment of attachments) {
-            const { file, filePart } = await processAndUploadFile(attachment.url, attachment.contentType);
-            fileParts.push(filePart);
-            filesToCleanup.push(file); 
-        }
-
-        // b. Retrieve Context
-        const history = await getConversationHistory(serverId, userId, rawPrompt);
-
-        // c. Generate Response
-        const { text: responseText, sources, isShort } = await generateText(history, rawPrompt, fileParts);
-
-        // d. Typing Simulation & Locking
-        const typingDelay = calculateTypingDelay(responseText);
-        const typingStartTime = Date.now();
-        const typingInterval = setInterval(() => {
-            message.channel.sendTyping().catch(console.error);
-        }, 5000); 
-
-        // Wait for the response to arrive + ensure minimum typing time
-        const elapsed = Date.now() - typingStartTime;
-        if (elapsed < typingDelay) {
-            await new Promise(resolve => setTimeout(resolve, typingDelay - elapsed));
-        }
-        clearInterval(typingInterval);
-        
-        // e. Response Splitting (Goku sometimes replies in two messages - 5% chance)
-        let responseMessages = splitLongResponse(responseText);
-        const splitChance = Math.random() < 0.05;
-
-        if (responseMessages.length === 1 && splitChance && responseText.length > 50) {
-            const text = responseMessages[0];
-            const midIndex = Math.floor(text.length / 2);
-            const splitPoint = text.lastIndexOf('.', midIndex) !== -1 ? text.lastIndexOf('.', midIndex) + 1 : midIndex;
-            
-            responseMessages = [
-                text.substring(0, splitPoint).trim(),
-                text.substring(splitPoint).trim()
-            ].filter(m => m.length > 0);
-        }
-
-        // f. Send Response(s)
-        let replyMessage = message;
-        for (let i = 0; i < responseMessages.length; i++) {
-            if (i === 0) {
-                replyMessage = await replyMessage.reply({ content: responseMessages[i] });
-            } else {
-                replyMessage = await message.channel.send({ content: responseMessages[i] });
-            }
-        }
-
-        // g. Save both user and model messages to history, including the Discord message ID
-        await saveMessage(serverId, userId, rawPrompt, 'user', message.id, fileParts.map(fp => ({
-            mimeType: fp.fileData.mimeType,
-            fileUri: fp.fileData.fileUri
-        })));
-        await saveMessage(serverId, userId, responseText, 'model', replyMessage.id); 
-
-    } catch (error) {
-        console.error('Fatal Error during Message Processing:', error);
-        if (isTagged) {
-             message.reply("Ah, crud! Something went wrong while I was powering up that message. Try sending it again!");
-        }
-    } finally {
-        // h. Unlock channel and Cleanup Gemini Files
-        isBotResponding.delete(channelId);
-        for (const file of filesToCleanup) {
-            try {
-                await geminiClient.files.delete({ name: file.name });
-            } catch (error) {
-                console.warn(`Could not delete Gemini file ${file.name}:`, error.message);
-            }
-        }
-    }
-});
-
-client.login(DISCORD_BOT_TOKEN);
-        
+    console.log(`[DB]
